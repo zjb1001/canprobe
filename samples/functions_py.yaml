@@ -1,0 +1,57 @@
+# 功能分析规格 —— 直接嵌入 Python"参考功能代码"执行。
+#
+# 每个 function 可以写一个 update(t, s, dt) 函数（替代声明式 enter/exit）：
+#   - s['信号名'] 或 s.信号名  信号当前值（零阶保持）
+#   - s.prev.信号名            上一采样点的值
+#   - s.rising('X') / s.falling('X') / s.changed('X')   边沿判断
+#   - reason('说明')           标注本次状态跳变的原因（作为证据 summary）
+#   - attempt('说明')          标注一次"尝试"；若本 tick 未发生跳变 → 记为"未进入"
+#   - return 新状态；return None 表示保持当前状态
+#   - ACTIVE / ACTIVE_STATES    声明哪些状态算"激活"（用于进入/退出语义）
+#   - INITIAL                   初始状态
+#
+# 适合声明式写不动的逻辑：计数器、定时器、滞回、跨信号运算等。
+functions:
+  - id: cruise_py
+    name: "定速巡航 (Python 逻辑)"
+    description: "带滞回的巡航：SET 按下且车速≥30 进入，刹车/取消退出，车速<25 掉速退出"
+    code: |
+      ACTIVE = "ACTIVE"
+      INITIAL = "IDLE"
+
+      def update(t, s, dt):
+          if s.rising("CruiseSetBtn"):
+              if s.VehSpd >= 30 and s.BrakePedal == 0:
+                  reason(f"SET 按下且车速 {s.VehSpd:.1f} >= 30")
+                  return "ACTIVE"
+              else:
+                  attempt(f"SET 按下但车速 {s.VehSpd:.1f} < 30，未进入")
+          if s.BrakePedal == 1 or s.CruiseCancelBtn == 1:
+              reason(f"刹车={s.BrakePedal} / 取消={s.CruiseCancelBtn}")
+              return "IDLE"
+          if s.VehSpd < 25:
+              reason(f"车速掉至 {s.VehSpd:.1f} < 25")
+              return "IDLE"
+          return None
+
+  - id: overtq_py
+    name: "过温保护 (Python 计时)"
+    description: "温度 >120 持续 0.5s 才进入（防抖），<105 退出 —— 演示计时逻辑"
+    code: |
+      ACTIVE = "ACTIVE"
+      INITIAL = "IDLE"
+      over_since = None           # 模块级变量可在多次调用间保持（计时）
+
+      def update(t, s, dt):
+          global over_since
+          if s.MotorTemp > 120:
+              if over_since is None:
+                  over_since = t
+              if t - over_since >= 0.5:
+                  return "ACTIVE"
+          else:
+              over_since = None
+              if s.MotorTemp < 105:
+                  reason(f"温度降至 {s.MotorTemp:.1f}")
+                  return "IDLE"
+          return None

@@ -1,0 +1,36 @@
+# 功能分析规格：声明需要回放并给出"进入/退出/为何未进入"证据的功能。
+#
+# 条件语法：
+#   - 数值/枚举比较: {signal: 信号名, op: 操作符, value: 阈值}
+#     op ∈ {>, <, >=, <=, ==, !=}
+#   - 边沿触发:      {rising: 信号名} / {falling: 信号名} / {changed: 信号名}
+#   - 逻辑组合:      {all: [...]} / {any: [...]} / {not: {...}}
+#
+# 每个 function 字段：
+#   id / name / description   标识与描述
+#   enter  进入条件（满足即进入）
+#   exit   退出条件（满足即退出，可选）
+#   trigger（可选）"尝试"条件：触发它但 enter 未满足 → 记为"被阻止的进入"，
+#            用于回答"为什么没有进入"。缺省时自动取 enter 中的边沿条件。
+#   initial（可选，默认 false）初始是否已处于激活态
+functions:
+  - id: cruise
+    name: "定速巡航 (Cruise Control)"
+    description: "按下 SET 且车速≥30 km/h 且未踩刹车 → 进入；踩刹车/按取消 → 退出"
+    enter:
+      all:
+        - rising: CruiseSetBtn
+        - {signal: VehSpd, op: ">=", value: 30}
+        - {signal: BrakePedal, op: "==", value: 0}
+    exit:
+      any:
+        - {signal: BrakePedal, op: "==", value: 1}
+        - {signal: CruiseCancelBtn, op: "==", value: 1}
+
+  - id: overtemp
+    name: "电机过温保护 (Over-temperature)"
+    description: "电机温度 > 120 ℃ 进入保护，< 105 ℃ 退出（滞回）"
+    enter:
+      {signal: MotorTemp, op: ">", value: 120}
+    exit:
+      {signal: MotorTemp, op: "<", value: 105}

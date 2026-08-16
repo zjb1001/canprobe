@@ -1,0 +1,11 @@
+# 核心依赖
+cantools>=42.0
+fastapi>=0.100
+uvicorn[standard]>=0.23
+python-multipart>=0.0.5
+PyYAML>=6.0
+numpy>=1.21
+
+# 可选（重型日志格式，按需安装）
+# python-can>=4.3   # 解析 .blf
+# asammdf>=7.3      # 解析 .mf4

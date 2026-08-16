@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CanProbe · CAN 总线回放与信号分析</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">CanProbe <span class="brand-sub">CAN 总线回放与信号分析</span></div>
+    <div class="status" id="status">未加载数据</div>
+    <div class="actions">
+      <button id="btnSample" class="btn btn-accent">加载示例</button>
+      <label class="btn filebtn">加载 DBC<input type="file" id="fileDbc" accept=".dbc" hidden /></label>
+      <label class="btn filebtn">加载日志<input type="file" id="fileLog" accept=".asc,.csv,.json,.trc,.blf,.mf4,.log" hidden /></label>
+      <label class="btn filebtn">加载功能规格<input type="file" id="fileSpec" accept=".yaml,.yml,.json" hidden /></label>
+      <button id="btnSpec" class="btn" title="在线编辑功能分析规格">编辑规格</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="panel">
+        <div class="panel-title">信号 <span id="signalCount" class="muted"></span></div>
+        <div class="addsig">
+          <input id="signalAdd" class="search" list="signalList" placeholder="输入信号名添加…" autocomplete="off" />
+          <datalist id="signalList"></datalist>
+          <button id="btnAddSignal" class="btn">添加</button>
+        </div>
+        <input id="signalSearch" class="search" placeholder="搜索信号 / 报文…" />
+        <div id="signalTree" class="tree"></div>
+      </div>
+      <div class="panel grow">
+        <div class="panel-title">功能</div>
+        <div id="functionList" class="funclist"></div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <div class="toolbar">
+        <button id="btnPrev" class="tb" title="上一帧">⏮</button>
+        <button id="btnPlay" class="tb play" title="播放/暂停">▶</button>
+        <button id="btnNext" class="tb" title="下一帧">⏭</button>
+        <span id="timeLabel" class="time">0.000 s</span>
+        <input type="range" id="seek" min="0" max="1000" value="0" class="seek" />
+        <select id="speed" class="speed" title="回放速度">
+          <option value="0.5">0.5×</option>
+          <option value="1" selected>1×</option>
+          <option value="2">2×</option>
+          <option value="5">5×</option>
+          <option value="10">10×</option>
+          <option value="25">25×</option>
+        </select>
+        <span id="rangeLabel" class="muted"></span>
+      </div>
+
+      <div class="charts-scroll">
+        <div id="chart" class="chart"></div>
+        <div id="stateChart" class="chart statechart"></div>
+      </div>
+
+      <div class="trace">
+        <div class="panel-title">报文跟踪 <span id="traceInfo" class="muted"></span></div>
+        <div class="table-wrap" id="traceWrap">
+          <table id="traceTable">
+            <thead>
+              <tr><th>时间</th><th>ID</th><th>报文</th><th>信号值</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+    </main>
+
+    <aside class="valuepanel">
+      <div class="vp-head">
+        <div class="panel-title">信号值 <span id="valueTime" class="muted"></span></div>
+        <div class="vtoggle">
+          <button id="vmAll" class="vmode">全部</button>
+          <button id="vmSel" class="vmode on">已勾选</button>
+        </div>
+      </div>
+      <div id="valueList" class="valuelist"></div>
+    </aside>
+  </div>
+
+  <div id="dropzone" class="dropzone hidden">
+    <div class="dropzone-inner">拖拽 DBC / 日志 / 规格文件到此处加载</div>
+  </div>
+
+  <div id="specModal" class="modal hidden">
+    <div class="modal-box">
+      <div class="modal-head">
+        <span>功能分析规格（YAML）</span>
+        <button id="specClose" class="btn">×</button>
+      </div>
+      <textarea id="specText" spellcheck="false"></textarea>
+      <div class="modal-foot">
+        <span id="specMsg" class="muted"></span>
+        <button id="specRun" class="btn btn-accent">保存并运行分析</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/vendor/echarts.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
