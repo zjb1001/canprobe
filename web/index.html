@@ -16,6 +16,7 @@
       <label class="btn filebtn">加载日志<input type="file" id="fileLog" accept=".asc,.csv,.json,.trc,.blf,.mf4,.log" hidden /></label>
       <label class="btn filebtn">加载功能规格<input type="file" id="fileSpec" accept=".yaml,.yml,.json" hidden /></label>
       <button id="btnSpec" class="btn" title="在线编辑功能分析规格">编辑规格</button>
+      <button id="btnDiag" class="btn" title="CAN 通信层诊断">通信诊断</button>
     </div>
   </header>
 
@@ -100,6 +101,19 @@
         <span id="specMsg" class="muted"></span>
         <button id="specRun" class="btn btn-accent">保存并运行分析</button>
       </div>
+    </div>
+  </div>
+
+  <div id="diagModal" class="modal hidden">
+    <div class="modal-box modal-box-wide">
+      <div class="modal-head">
+        <span>通信诊断</span>
+        <div class="diag-head-actions">
+          <a id="diagExport" class="btn" href="/api/diag/export?fmt=md" download="diagnosis-report.md">导出 Markdown</a>
+          <button id="diagClose" class="btn">×</button>
+        </div>
+      </div>
+      <div id="diagBody" class="diag-body"></div>
     </div>
   </div>
 

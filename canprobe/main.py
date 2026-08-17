@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .analyzer import SpecError, evaluate_timeline
+from .diag.api import router as diag_router
 from .log_parser import ParseError
 from .store import project
 
@@ -19,7 +20,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 WEB_DIR = BASE_DIR / "web"
 SAMPLES_DIR = BASE_DIR / "samples"
 
-app = FastAPI(title="CanProbe — CAN 总线回放与信号分析", version="0.1.0")
+app = FastAPI(title="CanProbe — CAN 总线回放与信号分析", version="0.2.0")
 
 # a private upload dir (kept out of git)
 _UPLOAD_DIR = Path(tempfile.gettempdir()) / "can_replay_uploads"
@@ -213,6 +214,11 @@ def load_sample():
     p.load_spec(str(spec), spec.read_text(encoding="utf-8"))
     return p.summary()
 
+
+# --------------------------------------------------------------------------- #
+# Diagnostics
+# --------------------------------------------------------------------------- #
+app.include_router(diag_router)
 
 # --------------------------------------------------------------------------- #
 # Static UI

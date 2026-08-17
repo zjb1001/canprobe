@@ -28,18 +28,20 @@ class SeriesStore:
             hi = t1 if t1 is not None else np.inf
             frames = [f for f in frames if lo <= f.t <= hi]
 
-        if frames:
-            order = np.argsort([f.t for f in frames], kind="stable")
-            frames = [frames[i] for i in order]
-            self._ts = np.array([f.t for f in frames], dtype=np.float64)
-            self._ids = np.array([f.frame_id for f in frames], dtype=np.uint32)
-            self._dlc = np.array([len(f.data) for f in frames], dtype=np.uint8)
+        # 分区：数据帧 → 紧凑数组；通信层事件（错误帧/状态）→ 单独列表
+        data_frames = sorted((f for f in frames if not f.is_error), key=lambda f: f.t)
+        self._events = sorted((f for f in frames if f.is_error), key=lambda f: f.t)
+
+        if data_frames:
+            self._ts = np.array([f.t for f in data_frames], dtype=np.float64)
+            self._ids = np.array([f.frame_id for f in data_frames], dtype=np.uint32)
+            self._dlc = np.array([len(f.data) for f in data_frames], dtype=np.uint8)
             max_dlc = int(self._dlc.max()) if len(self._dlc) else 0
-            data = np.zeros((len(frames), max_dlc), dtype=np.uint8)
-            for i, f in enumerate(frames):
+            data = np.zeros((len(data_frames), max_dlc), dtype=np.uint8)
+            for i, f in enumerate(data_frames):
                 data[i, :len(f.data)] = np.frombuffer(f.data, dtype=np.uint8)
             self._data = data
-            self._channels = np.array([f.channel for f in frames], dtype=np.uint8)
+            self._channels = np.array([f.channel for f in data_frames], dtype=np.uint8)
             self._times = np.unique(self._ts)
         else:
             self._ts = np.array([], dtype=np.float64)
@@ -69,6 +71,18 @@ class SeriesStore:
     @property
     def frame_count(self) -> int:
         return len(self._ts)
+
+    def frame_arrays(self):
+        """返回紧凑帧数组 (ts, ids, dlc, channels)，供外部分析（如诊断引擎）。
+
+        均为按时间升序的 NumPy 数组；is_extended 可由 ids > 0x7FF 推导。
+        仅含数据帧；错误帧/状态事件见 :meth:`events`。
+        """
+        return self._ts, self._ids, self._dlc, self._channels
+
+    def events(self) -> list:
+        """返回通信层事件（错误帧 / 总线状态），按时间升序，供 Tier 2/3 诊断。"""
+        return self._events
 
     def signal_names(self) -> list[str]:
         if self.dbc is None:

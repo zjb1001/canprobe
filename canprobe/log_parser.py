@@ -30,15 +30,40 @@ class Frame:
     data: bytes
     channel: int = 0
     is_extended: bool = False
+    # 通信层事件字段（非数据帧使用；数据帧保持默认值）
+    kind: str = "data"  # data | error | status | remote | overload
+    error_type: str = ""  # stuff | form | crc | ack | bit | other | ""
+    tec: Optional[int] = None  # 发送错误计数
+    rec: Optional[int] = None  # 接收错误计数
+    state: str = ""  # active | passive | bus_off | ""
+    direction: str = ""  # rx | tx | ""
+
+    @property
+    def is_error(self) -> bool:
+        """是否为通信层事件（非普通数据帧）。"""
+        return self.kind != "data"
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "t": self.t,
             "id": self.frame_id,
             "data": self.data.hex(" "),
             "channel": self.channel,
             "is_extended": self.is_extended,
         }
+        if self.kind != "data":
+            d["kind"] = self.kind
+            if self.error_type:
+                d["error_type"] = self.error_type
+            if self.tec is not None:
+                d["tec"] = self.tec
+            if self.rec is not None:
+                d["rec"] = self.rec
+            if self.state:
+                d["state"] = self.state
+            if self.direction:
+                d["direction"] = self.direction
+        return d
 
 
 _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
@@ -96,6 +121,38 @@ _ASC_BASE_RE = re.compile(r"^\s*base\s+(\w+)\s+timestamps\s+(\w+)", re.IGNORECAS
 _ASC_DATA_RE = re.compile(
     r"^\s*(?P<t>\d+(?:\.\d+)?)\s+(?P<ch>\d+)\s+(?P<id>[0-9a-fA-Fx]+)\s+(?P<dir>Rx|Tx)\s+d\s+(?P<dlc>\d+)\s+(?P<data>[0-9a-fA-F ]+)\s*$"
 )
+_ASC_EVENT_TS_RE = re.compile(r"^\s*(?P<t>\d+(?:\.\d+)?)\s+(?P<ch>\d+)\s+(?P<rest>.*)$")
+
+
+def _parse_asc_event(line: str) -> Optional[Frame]:
+    """Best-effort 解析 Vector ASC 的错误帧 / 总线状态事件行。
+
+    ASC 各版本错误帧语法不一（Vector 版本演化），此处做启发式关键词匹配，
+    能力由诊断引擎的 Capabilities 显式声明，缺失时降级而非静默。
+    """
+    m = _ASC_EVENT_TS_RE.match(line)
+    if not m:
+        return None
+    rl = m.group("rest").lower()
+    if "errorframe" in rl or "error frame" in rl:
+        et = "other"
+        for kw, name in (("stuff", "stuff"), ("form", "form"), ("crc", "crc"),
+                         ("ack", "ack"), ("bit", "bit")):
+            if kw in rl:
+                et = name
+                break
+        return Frame(t=float(m.group("t")), frame_id=0, data=b"",
+                     channel=int(m.group("ch")), kind="error", error_type=et)
+    if "busoff" in rl or "bus off" in rl:
+        return Frame(t=float(m.group("t")), frame_id=0, data=b"",
+                     channel=int(m.group("ch")), kind="status", state="bus_off")
+    if "error passive" in rl or "errorpassive" in rl:
+        return Frame(t=float(m.group("t")), frame_id=0, data=b"",
+                     channel=int(m.group("ch")), kind="status", state="passive")
+    if "error active" in rl or "erroractive" in rl:
+        return Frame(t=float(m.group("t")), frame_id=0, data=b"",
+                     channel=int(m.group("ch")), kind="status", state="active")
+    return None
 
 
 def parse_asc(text: str) -> list[Frame]:
@@ -117,6 +174,9 @@ def parse_asc(text: str) -> list[Frame]:
             continue
         m = _ASC_DATA_RE.match(line)
         if not m:
+            ev = _parse_asc_event(line)
+            if ev is not None:
+                frames.append(ev)  # 错误帧/状态事件（相对时间戳）
             continue
         t = float(m.group("t"))
         frame_id = int(m.group("id"), base)
@@ -279,6 +339,38 @@ def parse_trc(text: str) -> list[Frame]:
 # --------------------------------------------------------------------------- #
 # BLF / MF4 (optional heavy formats)
 # --------------------------------------------------------------------------- #
+# python-can 错误帧的 arbitration_id 高位编码错误类型（SocketCAN 惯例），best-effort 映射
+_BLF_ERR_FLAGS = {
+    0x00000001: "stuff", 0x00000002: "form", 0x00000004: "ack",
+    0x00000008: "bit", 0x00000010: "bit", 0x00000020: "crc",
+}
+
+
+def _blf_frame(msg) -> Frame:
+    """把 python-can 的 Message 转成 Frame，识别错误帧。"""
+    arb = int(getattr(msg, "arbitration_id", 0))
+    is_err = bool(getattr(msg, "is_error_frame", False))
+    if is_err:
+        et = "other"
+        for flag, name in _BLF_ERR_FLAGS.items():
+            if arb & flag:
+                et = name
+                break
+        return Frame(
+            t=float(msg.timestamp), frame_id=arb & 0x1FFFFFFF, data=b"",
+            channel=int(getattr(msg, "channel", 0) or 0),
+            is_extended=bool(getattr(msg, "is_extended_id", False)),
+            kind="error", error_type=et,
+        )
+    return Frame(
+        t=float(msg.timestamp),
+        frame_id=arb,
+        data=bytes(msg.data),
+        channel=int(getattr(msg, "channel", 0) or 0),
+        is_extended=bool(msg.is_extended_id),
+    )
+
+
 def parse_blf(path: str) -> list[Frame]:
     try:
         import can
@@ -289,15 +381,7 @@ def parse_blf(path: str) -> list[Frame]:
     frames: list[Frame] = []
     with BLFReader(path) as reader:
         for msg in reader:
-            frames.append(
-                Frame(
-                    t=float(msg.timestamp),
-                    frame_id=int(msg.arbitration_id),
-                    data=bytes(msg.data),
-                    channel=int(getattr(msg, "channel", 0) or 0),
-                    is_extended=bool(msg.is_extended_id),
-                )
-            )
+            frames.append(_blf_frame(msg))
     frames.sort(key=lambda f: f.t)
     return frames
 
@@ -443,6 +527,9 @@ def _iter_asc(path: str):
             continue
         m = _ASC_DATA_RE.match(line)
         if not m:
+            ev = _parse_asc_event(line)
+            if ev is not None:
+                yield ev
             continue
         t = float(m.group("t"))
         if is_absolute:
@@ -477,13 +564,7 @@ def _iter_blf(path: str):
         raise ParseError(f"BLF 需要 python-can: {e}")
     with BLFReader(path) as reader:
         for msg in reader:
-            yield Frame(
-                t=float(msg.timestamp),
-                frame_id=int(msg.arbitration_id),
-                data=bytes(msg.data),
-                channel=int(getattr(msg, "channel", 0) or 0),
-                is_extended=bool(msg.is_extended_id),
-            )
+            yield _blf_frame(msg)
 
 
 def iter_frames(path: str, t0=None, t1=None, max_frames=None):

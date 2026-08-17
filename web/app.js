@@ -585,6 +585,89 @@ $("specRun").addEventListener("click", async () => {
 });
 
 // ---------------------------------------------------------------------------
+// 通信诊断
+// ---------------------------------------------------------------------------
+const SEV_ORDER = { critical: 0, error: 1, warn: 2, info: 3 };
+const SEV_BADGE = { critical: "sev-crit", error: "sev-err", warn: "sev-warn", info: "sev-info" };
+
+async function openDiag() {
+  $("diagModal").classList.remove("hidden");
+  $("diagBody").innerHTML = '<div class="muted" style="padding:14px">正在诊断…</div>';
+  try {
+    renderDiag(await api("/api/diag/report"));
+  } catch (e) {
+    $("diagBody").innerHTML = `<div class="diag-error">诊断失败: ${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function renderDiag(report) {
+  const cap = report.capabilities || {};
+  const sum = report.summary || {};
+  const metrics = report.metrics || {};
+  const findings = [...(report.findings || [])]
+    .sort((a, b) => (SEV_ORDER[a.severity] ?? 9) - (SEV_ORDER[b.severity] ?? 9));
+
+  let html = "";
+
+  // 概览
+  const loadMean = (metrics.load_mean_pct || [])[0];
+  const loadPeak = (metrics.load_peak_pct || [])[0];
+  const cells = [
+    ["数据帧", sum.frame_count ?? 0],
+    ["时间跨度", `${(sum.span_s ?? 0).toFixed(2)} s`],
+    ["报文 ID", sum.message_ids ?? 0],
+    ["节点", (sum.nodes || []).join(", ") || "—"],
+    ["错误事件", sum.error_events ?? 0],
+    ["状态事件", sum.status_events ?? 0],
+    ["平均负载", loadMean != null ? `${loadMean} %` : "—"],
+    ["峰值负载", loadPeak != null ? `${loadPeak} %` : "—"],
+  ];
+  html += `<div class="diag-section"><div class="diag-title">概览</div><div class="diag-grid">`;
+  for (const [k, v] of cells) html += `<div class="diag-cell"><div class="diag-cell-v">${escapeHtml(String(v))}</div><div class="diag-cell-k">${escapeHtml(k)}</div></div>`;
+  html += `</div></div>`;
+
+  // 能力清单
+  html += `<div class="diag-section"><div class="diag-title">能力清单</div>`;
+  html += `<div class="diag-cap">可用：${(cap.available_checks || []).map(c => `<span class="chip chip-on">${escapeHtml(c)}</span>`).join(" ") || '<span class="muted">—</span>'}</div>`;
+  if (cap.unavailable_checks && cap.unavailable_checks.length) {
+    html += `<div class="diag-cap">不可用：${cap.unavailable_checks.map(u => `<span class="chip chip-off" title="${escapeHtml(u.reason)}">${escapeHtml(u.check)}</span>`).join(" ")}</div>`;
+  }
+  html += `</div>`;
+
+  // 诊断结论
+  html += `<div class="diag-section"><div class="diag-title">诊断结论 <span class="muted">(${findings.length})</span></div>`;
+  if (!findings.length) {
+    html += `<div class="muted" style="padding:4px">未发现异常（注意：仅在「可用检查」范围内有效）。</div>`;
+  } else {
+    html += `<div class="diag-findings">`;
+    for (const f of findings) {
+      const conf = f.confidence != null && f.confidence < 1
+        ? `<span class="chip chip-conf">推断 ${Math.round(f.confidence * 100)}%</span>` : "";
+      const tinfo = f.time_start != null
+        ? `<span class="diag-time">t=${f.time_start.toFixed(3)}~${(f.time_end ?? f.time_start).toFixed(3)}s</span>` : "";
+      html += `<div class="diag-finding ${SEV_BADGE[f.severity] || ""}" data-t="${f.time_start ?? ""}">
+        <div class="diag-finding-head"><span class="sev-badge">${escapeHtml(f.severity)}</span><b>${escapeHtml(f.title)}</b>${conf}${tinfo}</div>
+        <div class="diag-finding-body">${escapeHtml(f.explanation)}</div>
+        ${f.suggestion ? `<div class="diag-finding-sug">建议：${escapeHtml(f.suggestion)}</div>` : ""}
+      </div>`;
+    }
+    html += `</div>`;
+  }
+  html += `</div>`;
+
+  $("diagBody").innerHTML = html;
+
+  // 点击结论跳转到对应时刻（证据链落地）
+  document.querySelectorAll(".diag-finding[data-t]").forEach((el) => {
+    const t = parseFloat(el.dataset.t);
+    if (!isNaN(t)) el.addEventListener("click", () => setCursor(t));
+  });
+}
+
+$("btnDiag").addEventListener("click", openDiag);
+$("diagClose").addEventListener("click", () => $("diagModal").classList.add("hidden"));
+
+// ---------------------------------------------------------------------------
 // 事件绑定 & 拖拽
 // ---------------------------------------------------------------------------
 $("btnSample").addEventListener("click", loadSample);
