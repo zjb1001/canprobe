@@ -1,0 +1,501 @@
+# =============================================================================
+# HBA 液压制动辅助 —— "Wild-HBA" 紧急制动全过程功能规格
+#
+# 适用日志: samples/Wild-HBA.blf  (= LogData/Wild-HBA .blf，单通道 CAN，8.74 s，
+#                                  24688 帧，65 个 CAN ID)
+# 适用 DBC : samples/03_CCAN_EP_v2.1.0_20260417-MOD.dbc
+#
+# -----------------------------------------------------------------------------
+# 这份日志录到了什么
+# -----------------------------------------------------------------------------
+# 一次完整的驾驶员紧急制动：82.8 km/h 巡行 → t=3.98 s 驾驶员猛踩制动 →
+# HBA 助力增压 → ABS/EBD 全程调节 → t=7.60 s 整车静止。全程 3.6 s、-10.8 m/s²。
+#
+#   HBA 是"驾驶员发起"的，不是 AEB：
+#     * 日志里根本没有 0x32E FCAM_AEB_ / 0x335 ADCU_AEB_ 报文（DBC 中 HBA 的
+#       外部请求源 FCAM_AEB_HBA_Req / ADCU_AEB_HBA_Req 就在这两条上）；
+#     * WCBS_AEB_Available_Flag 全程 "Not available"、AEB_Active_Flag 全程
+#       "Not active"、ACC_DriverOverride 全程 "No override"。
+#   所以这条链路只有一个触发源：制动踏板速度 + 主缸压力梯度。
+#
+# -----------------------------------------------------------------------------
+# 实测时间线（t 相对日志起点）
+# -----------------------------------------------------------------------------
+#   3.50–3.96  巡行。车速 82.8→81.9 km/h，主缸 0.28 bar，踏板 0 mm，
+#              轮缸压力全 0，aLong ≈ -0.4 m/s²（滑行）。
+#   3.981      踏板离开零位（Travel 0→2.0 mm）。制动起点。
+#   3.98–4.08  **猛踩**：Travel 0→14.2 mm / 100 ms ≈ 142 mm/s；
+#              主缸 0.28→18.63 bar / 80 ms ≈ 229 bar/s；
+#              踏板开度峰值 46.8 % @4.102。这是 HBA 的触发判据（踏板速度 +
+#              主缸压力梯度双超门限），不是踏板绝对行程 —— 行程只有 14 mm。
+#              注意 function hba 报出的"检出猛踩"在 t=4.000，此刻主缸梯度
+#              (109 bar/s) 已过门限而踏板梯度 (20 mm/s) 还没起来 —— 100 ms 窗
+#              在斜坡第一个采样点上只看得到一段。压力先于行程越线本身合理：
+#              主缸 20 ms 周期、踏板 20 ms 但量化步长 0.2 mm，压力更灵敏。
+#   4.121      **ESC_HbaCtrlActv: Inactive → Active**（踏板离开零位后 140 ms、
+#              function 检出猛踩后 120 ms、主缸压力峰值后 60 ms）。HBA 进入。
+#   4.121+     驾驶员松力回落到 8 bar 左右并保持（Travel 11.8 mm、开度 ~38 %），
+#              而 WCBS_CircuitPress 被泵到 130→177 bar：
+#                  t=4.40  主缸 8.03 bar   回路 157.6 bar   FL 103.2 bar
+#                  t=5.12  主缸 4.53 bar   回路 177.6 bar（峰值）
+#              主缸→回路 ≈ 20~39 倍。这就是 HBA 助力的直接证据：制动力已经
+#              和驾驶员脚力解耦，由 WCBS 液压泵接管。
+#   4.181      ABSActive → Active（HBA 进入后 60 ms，压力已到抱死边界）。
+#   4.221      EBDActive → Active，随后 4.62/4.78/4.92/5.28/5.44/5.50/5.60
+#              连续 7 次通断 —— 后轴 EBD 正常循环调节（RL/RR 在 t=4.3 被泄到
+#              19.3/24.6 bar，前轴仍 104/102 bar，前后轴制动力分配在工作）。
+#   4.261      ABS_HAZActive → "Emergency brake light on"（ESS 紧急制动信号
+#              点亮危险灯），7.081 熄灭。WCBS_BrkLampReq 4.061 True → 7.821 False。
+#   4.2–6.0    减速度平台 -9.4 ~ -10.8 m/s²（峰值 -10.78 @5.963）。
+#   5.901      **ESC_HbaCtrlActv: Active → Inactive**。HBA 退出，
+#              驻留 1.78 s。此刻车速仍有 ~24 km/h、减速度仍 -10.6 m/s²，
+#              退出发生在驾驶员松踏板（6.0 s 起 Travel 10.0→7.8 mm）**之前**，
+#              是 HBA 自身的退出判据（车速/压力回落），不是驾驶员先松的脚。
+#   6.121      ABSActive → Inactive（车速 ~18 km/h），压力落到 ~34 bar 平台。
+#   7.601      ESC_VehicleStandstill → VEHICLE_STANDSTILL，
+#              Veh_DriveCondition → "Vehicle is stationary"。停住。
+#   8.721      重新起步（Veh_DriveCondition → moving forward）。
+#
+# -----------------------------------------------------------------------------
+# 结论
+# -----------------------------------------------------------------------------
+#   HBA 行为**符合设计预期**，本日志未发现 HBA 缺陷：
+#     · 触发及时（踏板起点后 140 ms）；
+#     · 助力有效（主缸 8 bar → 回路 158 bar，驾驶员松力后制动力未跟着掉）；
+#     · 与 ABS/EBD 的接力正确（HBA 先建压 → 60 ms 后 ABS 接管防抱死）；
+#     · 与 ESS 的联动正确（危险灯在减速度建立后点亮、车速降下来后熄灭）；
+#     · 退出干净（先于驾驶员松脚，无残留压力）；
+#     · ESC_HBAFlgFlt 全程 "No failure"、WCBS_Fault_Status "No Fault"、
+#       WCBS_BrakesystemFailSts "BBF_FullSys"（全系统可用，无降级）。
+#
+#   一个待澄清点（不是判定，是问题）：
+#     WCBS_Info.WCBSActive 在 t=4.001（踏板刚踩下、HBA 尚未进入）由 Active
+#     翻成 Inactive，直到 7.702（已静止 0.1 s）才回 Active —— 整个制动过程中
+#     这个"WCBS 激活"标志恰好是灭的。若该位语义为"WCBS 主动控制中"，则与
+#     HBA/ABS/EBD 同期为 Active 的事实矛盾；若语义为"待机可用"，则命名误导。
+#     函数 wcbs_active_check 把它单独拎出来做一条事件，供设计侧确认语义。
+#
+# -----------------------------------------------------------------------------
+# 约定
+#   * 事件类型：▲进入 = 进入受关注状态，▼退出 = 该状态结束。
+#     （由各 function 的 ACTIVE_STATES 决定。）
+#   * 带 VAL_ 表的信号在 canprobe 中解码为枚举**名字符串**，
+#     所以比较值写 "Active" 而不是 1。
+#   * 一个 function = 一条完整链路（请求 → 判决 → 执行 → 上下文），
+#     不是一个 bit。signals 段按 请求→反馈→上下文 顺序书写，
+#     点功能按钮即把整组信号按此顺序加入 Graphics。
+# =============================================================================
+
+functions:
+
+  # ===========================================================================
+  # HBA 全链路 —— 主功能，排查从这里开始
+  # ===========================================================================
+  - id: hba
+    name: "HBA 液压制动辅助 (全链路)"
+    description: >-
+      驾驶员踏板速度/主缸压力梯度 → WCBS 判决 → ESC_HbaCtrlActv → 液压泵增压
+      (CircuitPress / 四轮 EstWhlPress) → 整车减速度。状态机把一次紧急制动拆成
+      PANIC_APPLY（检出猛踩）/ BOOSTING（助力生效，含实测助力倍数）/
+      HBA_NO_BOOST（HBA 报激活但回路压力没上去）/ MISSED（猛踩了但 HBA 没进）
+      / FAULT 五种处境，reason 里直接带上主缸、回路、减速度的实际数值。
+      判"没进入"用的是踏板梯度而不是踏板绝对值 —— 本次事件踏板只踩到 14 mm，
+      按绝对行程判会漏掉整个 HBA 触发。
+    signals:
+      - WCBS_BrkPedalTravel           # 请求：踏板行程（触发判据的一半）
+      - WCBS_BrkPedalPct
+      - WCBS_MainCylinderPress        # 请求：主缸压力（触发判据的另一半）
+      - ESC_HbaCtrlActv               # 判决：HBA 激活
+      - ESC_HBAFlgFlt
+      - WCBS_CircuitPress             # 执行：助力后的回路压力
+      - WCBS_EstWhlPress_FL
+      - WCBS_EstWhlPress_FR
+      - WCBS_EstWhlPress_RL
+      - WCBS_EstWhlPress_RR
+      - WCBS_LongitudeACC             # 上下文：制动效果
+      - WCBS_VehicleSpeed
+      - WCBS_AEB_Active_Flag          # 上下文：排除 AEB 来源
+      - WCBS_MainCylinderPressValid
+      - WCBS_BrkPedalValid
+    code: |
+      ACTIVE_STATES = ["PANIC_APPLY", "BOOSTING", "HBA_NO_BOOST", "MISSED", "FAULT"]
+      INITIAL = "IDLE"
+
+      GRAD_WIN   = 0.10     # s，梯度观察窗（HBA 判据看的是 100 ms 量级的斜率）
+      PED_GRAD   = 60.0     # mm/s，踏板速度门限（实测本次 178 mm/s）
+      MCP_GRAD   = 100.0    # bar/s，主缸压力梯度门限（实测本次 230 bar/s）
+      MISS_TMO   = 0.40     # s，猛踩后超过这么久 HBA 还没进 → 判 MISSED
+      BOOST_MIN  = 2.0      # 回路/主缸 ≥ 该倍数才算"助力真的出来了"
+      BOOST_TMO  = 0.20     # s，HBA 激活后给液压泵的建压时间
+      PRESS_FLOOR= 1.0      # bar，主缸低于此值不算倍数（除零保护）
+
+      hist       = []       # [(t, travel, mcp)] 梯度窗
+      panic_t    = None     # 最近一次检出猛踩的时刻
+      hba_on_t   = None     # HBA 激活起点
+      missed     = False    # 本次踩踏已经报过 MISSED，不重复刷
+      peak_boost = 0.0
+
+      def grad(idx, t):
+          # 在 GRAD_WIN 窗内取最早样本，算平均斜率
+          old = None
+          for h in hist:
+              if t - h[0] <= GRAD_WIN:
+                  old = h
+                  break
+          if old is None or t - old[0] < 0.02:
+              return 0.0
+          return (hist[-1][idx] - old[idx]) / (t - old[0])
+
+      def update(t, s, dt):
+          global hist, panic_t, hba_on_t, missed, peak_boost
+
+          trv = s.WCBS_BrkPedalTravel
+          mcp = s.WCBS_MainCylinderPress
+          hba = s.ESC_HbaCtrlActv
+          if trv is None or mcp is None or hba is None:
+              return None          # 请求或反馈还没收到第一帧，先不下结论
+
+          trv = float(trv); mcp = float(mcp)
+          hist.append((t, trv, mcp))
+          hist = [h for h in hist if t - h[0] <= GRAD_WIN * 3]
+          dped = grad(1, t)
+          dmcp = grad(2, t)
+
+          # --- 故障优先 ---
+          if s.ESC_HBAFlgFlt == "Failure":
+              reason("ESC_HBAFlgFlt=Failure（主缸 %.2f bar，踏板 %.1f mm）→ "
+                     "HBA 已被判故障，后续不激活属保护行为" % (mcp, trv))
+              return "FAULT"
+          if (s.WCBS_MainCylinderPressValid != "Valid"
+                  or s.WCBS_BrkPedalValid != "Valid"):
+              reason("HBA 输入无效：MainCylinderPressValid=%s BrkPedalValid=%s → "
+                     "触发判据的两个输入都不可信"
+                     % (s.WCBS_MainCylinderPressValid, s.WCBS_BrkPedalValid))
+              return "FAULT"
+
+          # --- 触发判据：踏板速度 或 主缸压力梯度 超门限 ---
+          if hba != "Active" and (dped >= PED_GRAD or dmcp >= MCP_GRAD):
+              if panic_t is None:
+                  panic_t = t
+                  missed = False
+                  reason("检出紧急制动踩踏：踏板 %.0f mm/s（门限 %.0f）、"
+                         "主缸 %.0f bar/s（门限 %.0f），当前行程 %.1f mm / %.2f bar，"
+                         "车速 %s km/h —— 等待 HBA 判决"
+                         % (dped, PED_GRAD, dmcp, MCP_GRAD, trv, mcp,
+                            s.WCBS_VehicleSpeed))
+                  return "PANIC_APPLY"
+              return None
+
+          # --- HBA 已激活：看助力有没有真的出来 ---
+          if hba == "Active":
+              if hba_on_t is None:
+                  hba_on_t = t
+                  peak_boost = 0.0
+                  lat = ("%.0f ms" % ((t - panic_t) * 1000)) if panic_t else "未检出猛踩前置"
+                  reason("ESC_HbaCtrlActv → Active（距猛踩起点 %s）：主缸 %.2f bar、"
+                         "回路 %.1f bar、车速 %s km/h、aLong %s m/s² —— HBA 进入"
+                         % (lat, mcp, float(s.WCBS_CircuitPress or 0),
+                            s.WCBS_VehicleSpeed, s.WCBS_LongitudeACC))
+                  return "BOOSTING"     # 进入这一刻单独成事件，不被下面的助力播报覆盖
+              circ = float(s.WCBS_CircuitPress or 0)
+              ratio = circ / mcp if mcp > PRESS_FLOOR else None
+              if ratio:
+                  peak_boost = max(peak_boost, ratio)
+              if (t - hba_on_t) >= BOOST_TMO and (ratio is None or ratio < BOOST_MIN):
+                  reason("HBA 已 Active %.2f s，但回路压力 %.1f bar 相对主缸 %.2f bar "
+                         "没有明显放大（倍数 %s < %.1f）→ 判决层进了、执行层没跟上，"
+                         "查液压泵/增压阀"
+                         % (t - hba_on_t, circ, mcp,
+                            ("%.1f" % ratio) if ratio else "N/A", BOOST_MIN))
+                  return "HBA_NO_BOOST"
+              reason("HBA 助力中 %.2f s：主缸 %.2f bar → 回路 %.1f bar（%s 倍，峰值 %.0f 倍），"
+                     "轮缸 FL/FR/RL/RR = %s/%s/%s/%s bar，aLong %s m/s²，车速 %s km/h"
+                     % (t - hba_on_t, mcp, circ,
+                        ("%.0f" % ratio) if ratio else "N/A", peak_boost,
+                        s.WCBS_EstWhlPress_FL, s.WCBS_EstWhlPress_FR,
+                        s.WCBS_EstWhlPress_RL, s.WCBS_EstWhlPress_RR,
+                        s.WCBS_LongitudeACC, s.WCBS_VehicleSpeed))
+              return "BOOSTING"
+
+          # --- HBA 从 Active 落回 ---
+          if hba_on_t is not None:
+              dur = t - hba_on_t
+              hba_on_t = None
+              panic_t = None
+              reason("HBA 退出，驻留 %.2f s（峰值助力 %.0f 倍）：退出瞬间车速 %s km/h、"
+                     "aLong %s m/s²、主缸 %.2f bar、回路 %.1f bar"
+                     % (dur, peak_boost, s.WCBS_VehicleSpeed, s.WCBS_LongitudeACC,
+                        mcp, float(s.WCBS_CircuitPress or 0)))
+              return "RELEASED"
+
+          # --- 猛踩了但 HBA 一直没进 ---
+          if panic_t is not None and not missed and (t - panic_t) >= MISS_TMO:
+              missed = True
+              attempt("踏板梯度已达触发条件，但 %.2f s 内 ESC_HbaCtrlActv 未激活"
+                      % (t - panic_t))
+              reason("猛踩后 %.2f s HBA 仍 Inactive：主缸 %.2f bar、踏板 %.1f mm、"
+                     "车速 %s km/h、HBAFlgFlt=%s、AEB=%s → HBA 未触发"
+                     % (t - panic_t, mcp, trv, s.WCBS_VehicleSpeed,
+                        s.ESC_HBAFlgFlt, s.WCBS_AEB_Active_Flag))
+              return "MISSED"
+
+          if trv <= 0.5 and mcp < PRESS_FLOOR:
+              panic_t = None
+              missed = False
+              return "IDLE"
+          return None
+
+  # ===========================================================================
+  # ABS / EBD 调节段 —— HBA 建压之后接手的那一棒
+  # ===========================================================================
+  - id: abs_ebd
+    name: "ABS / EBD 制动力调节 (HBA 后段)"
+    description: >-
+      HBA 把压力顶到抱死边界之后，由 ABS（防抱死）和 EBD（前后轴分配）接管。
+      这里关心的是**接力时序**和**调节质量**：ABS 是否在 HBA 之后及时介入、
+      EBD 的循环次数、后轴是否被正常泄压。把四个轮速和四个轮缸压力摆在一起，
+      "某个轮压力上去了但轮速没掉"这种执行侧问题才看得见。
+    signals:
+      - ESC_HbaCtrlActv               # 上游：谁先建的压
+      - ABSActive                     # 判决
+      - EBDActive
+      - ABS_EBDFailed
+      - ABSFailed
+      - WCBS_EstWhlPress_FL           # 执行：四轮压力
+      - WCBS_EstWhlPress_FR
+      - WCBS_EstWhlPress_RL
+      - WCBS_EstWhlPress_RR
+      - WCBS_FLWheelSpeedKPH          # 效果：四轮轮速
+      - WCBS_FRWheelSpeedKPH
+      - WCBS_RLWheelSpeedKPH
+      - WCBS_RRWheelSpeedKPH
+      - WCBS_VehicleSpeed
+      - WCBS_LongitudeACC
+    code: |
+      ACTIVE_STATES = ["ABS_REG", "ABS_AFTER_HBA", "EBD_ONLY", "FAULT"]
+      INITIAL = "IDLE"
+
+      SLIP_WARN = 25.0      # %，轮速相对车速的滑移率告警门限
+      SPD_FLOOR = 5.0       # km/h，低于此速度滑移率没意义
+
+      abs_t     = None
+      hba_t     = None      # HBA 激活起点，用来算接力延时
+      ebd_cycles= 0
+      handed    = False     # ABS_AFTER_HBA 只报一次
+
+      def slip(s):
+          v = s.WCBS_VehicleSpeed
+          if v is None or float(v) < SPD_FLOOR:
+              return None, None
+          v = float(v)
+          worst = None; name = None
+          for w, k in (("FL", "WCBS_FLWheelSpeedKPH"), ("FR", "WCBS_FRWheelSpeedKPH"),
+                       ("RL", "WCBS_RLWheelSpeedKPH"), ("RR", "WCBS_RRWheelSpeedKPH")):
+              ws = s[k]
+              if ws is None:
+                  continue
+              sl = (v - float(ws)) / v * 100.0
+              if worst is None or sl > worst:
+                  worst, name = sl, w
+          return worst, name
+
+      def update(t, s, dt):
+          global abs_t, hba_t, ebd_cycles, handed
+          a = s.ABSActive
+          e = s.EBDActive
+          if a is None or e is None:
+              return None          # 反馈还没收到第一帧
+
+          if s.ESC_HbaCtrlActv == "Active" and hba_t is None:
+              hba_t = t
+          if s.rising("EBDActive"):
+              ebd_cycles += 1
+
+          if s.ABSFailed == "Fault" or s.ABS_EBDFailed == "EBD Failed":
+              reason("ABS/EBD 故障：ABSFailed=%s EBDFailed=%s → 本段调节数据不可用于评价 HBA"
+                     % (s.ABSFailed, s.ABS_EBDFailed))
+              return "FAULT"
+
+          if a == "Active":
+              sl, w = slip(s)
+              if abs_t is None:
+                  abs_t = t
+                  if hba_t is not None and not handed:
+                      handed = True
+                      reason("ABS 在 HBA 激活后 %.0f ms 介入（HBA 建压 → ABS 防抱死接力）："
+                             "轮缸 FL/FR/RL/RR = %s/%s/%s/%s bar，车速 %s km/h"
+                             % ((t - hba_t) * 1000,
+                                s.WCBS_EstWhlPress_FL, s.WCBS_EstWhlPress_FR,
+                                s.WCBS_EstWhlPress_RL, s.WCBS_EstWhlPress_RR,
+                                s.WCBS_VehicleSpeed))
+                      return "ABS_AFTER_HBA"
+                  reason("ABS 介入（无 HBA 前置）：车速 %s km/h、aLong %s m/s²"
+                         % (s.WCBS_VehicleSpeed, s.WCBS_LongitudeACC))
+                  return "ABS_REG"
+              note = ""
+              if sl is not None and sl >= SLIP_WARN:
+                  note = "；%s 轮滑移 %.0f%% ≥ %.0f%%（压力 %s bar 已建立但轮速跟不上）" % (
+                      w, sl, SLIP_WARN, s["WCBS_EstWhlPress_" + w])
+              reason("ABS 调节中 %.2f s，EBD 已循环 %d 次：aLong %s m/s²、车速 %s km/h、"
+                     "前轴 %s/%s bar、后轴 %s/%s bar%s"
+                     % (t - abs_t, ebd_cycles, s.WCBS_LongitudeACC, s.WCBS_VehicleSpeed,
+                        s.WCBS_EstWhlPress_FL, s.WCBS_EstWhlPress_FR,
+                        s.WCBS_EstWhlPress_RL, s.WCBS_EstWhlPress_RR, note))
+              return "ABS_REG"
+
+          if abs_t is not None:
+              dur = t - abs_t
+              abs_t = None
+              reason("ABS 退出，调节 %.2f s、EBD 循环 %d 次：车速 %s km/h、aLong %s m/s²"
+                     % (dur, ebd_cycles, s.WCBS_VehicleSpeed, s.WCBS_LongitudeACC))
+              return "IDLE"
+
+          if e == "Active":
+              reason("仅 EBD 在调节（ABS 未介入）：后轴 %s/%s bar vs 前轴 %s/%s bar"
+                     % (s.WCBS_EstWhlPress_RL, s.WCBS_EstWhlPress_RR,
+                        s.WCBS_EstWhlPress_FL, s.WCBS_EstWhlPress_FR))
+              return "EBD_ONLY"
+          return "IDLE"
+
+  # ===========================================================================
+  # ESS 紧急制动信号 / 制动灯 —— HBA 的对外表现
+  # ===========================================================================
+  - id: ess_brklamp
+    name: "ESS 紧急制动信号 + 制动灯 (HBA 联动)"
+    description: >-
+      制动灯请求（WCBS_BrkLampReq）与危险灯闪烁（ABS_HAZActive，ESS）是 HBA
+      对车外的表现。关心两件事：ESS 是否在减速度真的建立之后才点亮（点早了是
+      误触发，点晚了是漏报），以及制动结束后是否正常熄灭。制动灯请求缺失、或
+      危险灯在减速度已经消失后仍常亮，都在这里出事件。
+    signals:
+      - WCBS_BrkLampReq               # 请求：制动灯
+      - ABS_HAZActive                 # 请求：ESS 危险灯
+      - ESC_HbaCtrlActv               # 上下文：是不是 HBA 引起的
+      - ABSActive
+      - WCBS_LongitudeACC             # 上下文：减速度是否配得上 ESS
+      - WCBS_VehicleSpeed
+      - WCBS_MainCylinderPress
+    code: |
+      ACTIVE_STATES = ["ESS_ON", "ESS_UNJUSTIFIED", "ESS_STUCK", "LAMP_MISSING"]
+      INITIAL = "OFF"
+
+      ESS_DECEL = -5.0      # m/s²，能支撑 ESS 点亮的最小减速度（工程近似）
+      STUCK_TMO = 1.0       # s，减速度已消失但危险灯仍亮超过这么久 → 判卡死
+      LAMP_TMO  = 0.30      # s，明显制动但制动灯请求仍为 False 超过这么久
+
+      ess_t   = None
+      weak_t  = None        # ESS 亮着但减速度不足的起点
+      lamp_t  = None        # 明显制动但制动灯没请求的起点
+
+      def update(t, s, dt):
+          global ess_t, weak_t, lamp_t
+          haz = s.ABS_HAZActive
+          lamp = s.WCBS_BrkLampReq
+          acc = s.WCBS_LongitudeACC
+          if haz is None or lamp is None or acc is None:
+              return None          # 还没收到第一帧
+          acc = float(acc)
+          braking = float(s.WCBS_MainCylinderPress or 0) > 2.0 or acc <= ESS_DECEL
+
+          # 明显在制动却没有制动灯请求
+          if braking and lamp == "False":
+              if lamp_t is None:
+                  lamp_t = t
+              elif (t - lamp_t) >= LAMP_TMO:
+                  reason("已制动 %.2f s（主缸 %s bar、aLong %.2f m/s²）但 "
+                         "WCBS_BrkLampReq 仍为 False → 制动灯请求缺失"
+                         % (t - lamp_t, s.WCBS_MainCylinderPress, acc))
+                  return "LAMP_MISSING"
+          else:
+              lamp_t = None
+
+          if haz == "Emergency brake light on":
+              if ess_t is None:
+                  ess_t = t
+                  reason("ESS 点亮：aLong %.2f m/s²、车速 %s km/h、HBA=%s、ABS=%s、"
+                         "制动灯请求=%s" % (acc, s.WCBS_VehicleSpeed,
+                                            s.ESC_HbaCtrlActv, s.ABSActive, lamp))
+                  return "ESS_ON"
+              if acc > ESS_DECEL:
+                  if weak_t is None:
+                      weak_t = t
+                  elif (t - weak_t) >= STUCK_TMO:
+                      reason("ESS 已点亮 %.2f s，但最近 %.1f s 减速度只有 %.2f m/s²"
+                             "（门限 %.1f）→ 危险灯该灭没灭"
+                             % (t - ess_t, t - weak_t, acc, ESS_DECEL))
+                      return "ESS_STUCK"
+              else:
+                  weak_t = None
+              return None
+
+          if ess_t is not None:
+              dur = t - ess_t
+              ess_t = None
+              weak_t = None
+              reason("ESS 熄灭，点亮 %.2f s：车速 %s km/h、aLong %.2f m/s²、HBA=%s"
+                     % (dur, s.WCBS_VehicleSpeed, acc, s.ESC_HbaCtrlActv))
+              return "OFF"
+          return "OFF"
+
+  # ===========================================================================
+  # WCBSActive 语义核对 —— 本日志里唯一说不通的地方，单独成条
+  # ===========================================================================
+  - id: wcbs_active_check
+    name: "WCBSActive 与实际控制活动的一致性"
+    description: >-
+      WCBS_Info.WCBSActive 在本日志中于制动全程为 Inactive（t=4.001 翻灭、
+      7.702 才回 Active），而同期 HBA / ABS / EBD 都在 Active。这条 function
+      不下结论，只把矛盾窗口打成事件：如果该位语义是"WCBS 正在主动控制"，
+      那它反了；如果是"待机可用"，那命名与其他 *Active 位不一致。留给设计侧确认。
+    signals:
+      - WCBSActive                    # 待核对的位
+      - ESC_HbaCtrlActv               # 同期真实控制活动
+      - ABSActive
+      - EBDActive
+      - ESC_EscCtrlActv
+      - WCBS_Fault_Status             # 上下文：排除"因故障而 Inactive"
+      - WCBS_BrakesystemFailSts
+      - WCBS_IBS_Sys_Fault_Sts
+    code: |
+      ACTIVE_STATES = ["CONTRADICTION"]
+      INITIAL = "CONSISTENT"
+
+      HOLD = 0.20           # s，矛盾持续这么久才报，滤掉边界一两帧的错拍
+
+      bad_t = None
+
+      def update(t, s, dt):
+          global bad_t
+          w = s.WCBSActive
+          if w is None or s.ABSActive is None:
+              return None          # 还没收到第一帧
+
+          controlling = [n for n, v in (("HBA", s.ESC_HbaCtrlActv),
+                                        ("ABS", s.ABSActive),
+                                        ("EBD", s.EBDActive),
+                                        ("ESC", s.ESC_EscCtrlActv)) if v == "Active"]
+          contradiction = (w == "Inactive") and bool(controlling)
+
+          if contradiction:
+              if bad_t is None:
+                  bad_t = t
+              elif (t - bad_t) >= HOLD:
+                  reason("WCBSActive=Inactive 已 %.2f s，同期 %s 都在 Active；"
+                         "无故障可解释（Fault_Status=%s、BrakesystemFailSts=%s、"
+                         "IBS_Sys_Fault=%s）→ 该位语义需设计侧确认"
+                         % (t - bad_t, "/".join(controlling), s.WCBS_Fault_Status,
+                            s.WCBS_BrakesystemFailSts, s.WCBS_IBS_Sys_Fault_Sts))
+                  return "CONTRADICTION"
+              return None
+
+          if bad_t is not None:
+              bad_t = None
+              if not controlling:
+                  reason("矛盾窗口结束：HBA/ABS/EBD/ESC 均已退出，WCBSActive 仍为 %s —— "
+                         "矛盾消失只是因为没人在控制了，该位本身尚未翻回 Active（本日志 "
+                         "7.702 s 才翻回），语义存疑不因此解除" % w)
+              else:
+                  reason("WCBSActive 与实际控制活动恢复一致（WCBSActive=%s，正在控制: %s）"
+                         % (w, "/".join(controlling)))
+              return "CONSISTENT"
+          return None

@@ -272,10 +272,10 @@ def _physical_findings(events, cfg: DiagConfig) -> list[Finding]:
 # --------------------------------------------------------------------------- #
 # 入口
 # --------------------------------------------------------------------------- #
-def _detect_capabilities(channels, events) -> Capabilities:
+def _detect_capabilities(channels, events, dbc=None) -> Capabilities:
     """从解析出的事件实测探测能力（非文档假定）。"""
     n_ch = int(max(channels)) + 1 if len(channels) else 1
-    return Capabilities.detect(events, n_ch)
+    return Capabilities.detect(events, n_ch, has_dbc=dbc is not None)
 
 
 def run_diagnostics(store, dbc=None, config: Optional[DiagConfig] = None) -> dict:
@@ -297,7 +297,7 @@ def run_diagnostics(store, dbc=None, config: Optional[DiagConfig] = None) -> dic
     events = list(store.events()) if hasattr(store, "events") else []
 
     cfg = config or DiagConfig.from_dbc(dbc)
-    cap = _detect_capabilities(channels, events)
+    cap = _detect_capabilities(channels, events, dbc)
 
     load_findings, means, peaks = _load_findings(ts, dlc, is_extended, channels, cfg, cap)
     findings = load_findings

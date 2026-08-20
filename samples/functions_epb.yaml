@@ -1,0 +1,526 @@
+# =============================================================================
+# EPB 电子驻车制动 —— 夹紧 / 释放(含DAR) / 故障与反馈一致性 全链路功能规格
+#
+# 适用 DBC : samples/03_CCAN_EP_v2.1.0_20260417-MOD.dbc  (WCBS EBS 系统)
+# 业务逻辑参考 flavor: VINFAST/VN1（安全屏障阈值/DAR 判据为该 flavor 的架构分析
+#   结论，非 VINFAST 车型需复核；本文件的状态机只依赖下方列出的可观测总线信号）
+#
+# -----------------------------------------------------------------------------
+# 产出方式：dualdesign（多模型对抗式方案设计）
+#   Draft A = Claude Opus 4.8 独立起草，Draft B = GPT-5.6 Sol 独立起草，
+#   互评 1 轮后由编排器核对 DBC 原始 VAL_ 表逐条验证双方引用的信号枚举，
+#   发现两版草稿与两版评审都有基于"猜测枚举"的错误，本文件是修正后的终稿。
+#   完整迭代记录见 Parse/EPB_CanprobeSpec_VINFAST_VN1_DualModelDesign_Parse.md
+#
+# -----------------------------------------------------------------------------
+# 关键 DBC 事实核查（评审阶段发现两版草稿都有猜测性假设，以下是逐条核实结论）
+# -----------------------------------------------------------------------------
+#   * ESC_VehicleStandstill      VAL_ 525: 0 "NO_VEHICLE_STANDSTILL" 1 "VEHICLE_STANDSTILL"
+#     （字符串枚举，两版草稿的猜测方向都对，但评审阶段两个模型都误判成"无枚举/纯数值"
+#      并列为 Must-Fix——这是本次 dualdesign 里被识别出的"评审幻觉"，已用 DBC 原文纠正）
+#   * WCBS_ADCU_VAP_VehicleStandstill VAL_ 644: 0 "Moving" 1 "Standstill"（字符串枚举，
+#     两版草稿都误写成 ==1 数值比较，已修正为字符串比较）
+#   * EPB_Swch_Mafnc             VAL_ 560: 0 "No Error" 1 "Error"（字符串枚举，
+#     两版草稿都误写成 =="1"/=="1.0"/==1 数值比较，已修正）
+#   * M2SApplyReleaseRequest     VAL_ 566: 0 "No request" 1 "Request"（只是"有无请求"，
+#     **不含方向**；两版草稿都臆测其值里包含"Apply"/"Release"字样做方向判断，
+#     该假设在 DBC 层面不成立，已删除，改为方向由开关边沿/当前 EPB_Sts 推断）
+#   * EPB_Sts                    VAL_ 560: 0 Unknown/1 Released/2 Locked/3 Releasing/
+#     4 Locking/7 Invalid（字符串枚举，与两版草稿假设一致，直接使用）
+#   * WCBS_ADCU_VAP_EPBState     VAL_ 644: 0 Released/1 Applied/2 Releasing/3 Applying
+#   * CVC_EPB_SwitchSta          VAL_ 217: 0 Not Pressed/1 Pressed/2 Reserved/3 Invalid
+#     —— 单一点动开关，无独立 Apply/Release 两路信号，方向靠"当前 EPB 终态"消歧
+#     （已锁→按下视为 Release 意图；已释放→按下视为 Apply 意图，属工程假设，非总线直证）
+#   * EPB_SysDspMsgReq   VAL_ 560: 0 Off/1 BrakeForceNotEnough/2 ParkBrkOverheat/
+#     3 ParkOnTooHighSlope/4 DAR_Nok_DoorOpen/5-7 Reserved
+#   * CVC_ACTGear        VAL_ 217: 0 P/1 R/2 N/3 D/4-6 Reserved/7 Fault
+#   * WCBS_MainCylinderPressValid / WCBS_BrkPedalValid: 0 Valid/1 Invalid
+#
+# -----------------------------------------------------------------------------
+# 术语与措辞纪律（评审共识：REJECT 不可冒充确定结论）
+# -----------------------------------------------------------------------------
+#   安全屏障内部变量（SSL_enable_apply_line / DriverState / VehicleState）不在
+#   CAN 总线上。本规格任何"被阻止"的判断都只是据可观测信号的【推断】，状态命名
+#   统一带 SUSPECTED_ 前缀，reason() 文本里显式写"推断，非总线直接证据"。
+#   请求发出后既无 DspMsg 也无法用可观测信号解释仍未执行的，归类
+#   NO_VISIBLE_CAUSE（不臆测是执行层还是内部拒绝）。
+#
+# 三个 function：
+#   epb_apply    夹紧全链路（请求 → 判决 → Locking → Locked，含"为什么没夹紧"）
+#   epb_release  释放全链路，含 DAR 自动释放候选路径
+#   epb_health   故障位 / 开关健康度 / 双反馈(EPB_Sts vs ADCU_VAP_EPBState)一致性
+#                （独立处境，排查也可以先看这条）
+#
+# 约定：
+#   * VAL_ 枚举在 canprobe 中解码为字符串名，比较值一律写字符串。
+#   * 点动开关在双发送者场景下会抖动，请求边沿需去抖（候选值持续 ≥ HOLD 才确认）。
+#   * signals 段按 请求→反馈→上下文 顺序，点功能按钮整组进 Graphics。
+# =============================================================================
+
+functions:
+
+  # ===========================================================================
+  # EPB 夹紧 (Apply) 全链路
+  # ===========================================================================
+  - id: epb_apply
+    name: "EPB 夹紧 Apply (全链路)"
+    description: >-
+      驾驶员按 P 键（当前处于 Released/Unknown 时视为 Apply 意图）或 M2S 请求
+      镜像变化 → EPB_Sts: Unknown/Released→Locking→Locked。请求发出后若未见
+      Locking：优先看 EPB_SysDspMsgReq（总线直接证据）；否则用 ESC_VehicleStandstill
+      / WCBS_ADCU_VAP_VehicleStandstill 推断车辆是否静止（Apply 安全前提的
+      近似，非直接证据）；两者都不成立则归 NO_VISIBLE_CAUSE，不臆测根因。
+    signals:
+      - CVC_EPB_SwitchSta              # 请求：驾驶员 P 键
+      - M2SApplyReleaseRequest         # 请求：MOD→ACT 内部请求镜像（仅"有无请求"，无方向）
+      - EPB_Sts                        # 反馈：EPB 总状态
+      - WCBS_ADCU_VAP_EPBState         # 反馈：ADCU 侧同一物理状态（交叉验证）
+      - EPB_SysDspMsgReq               # 反馈：仪表消息（被阻止原因的直接文本）
+      - EPB_SysWrnIndReq
+      - EPB_SysStatIndReq
+      - ESC_VehicleStandstill          # 上下文：静止（Apply 前提，推断用，冗余腿1）
+      - WCBS_ADCU_VAP_VehicleStandstill # 上下文：静止（推断用，冗余腿2，ADCU侧）
+      - WCBS_MainCylinderPress
+      - CVC_ACTGear
+      - WCBS_EPB_Fault                 # 上下文：故障总位（不在此短路，仅标注见 epb_health）
+      - EPB_Swch_Mafnc
+      - EPB_CDPActive
+    code: |
+      ACTIVE_STATES = ["APPLY_REQUESTED", "APPLYING",
+                        "APPLY_SUSPECTED_BLOCKED", "APPLY_NO_VISIBLE_CAUSE",
+                        "APPLY_FEEDBACK_UNKNOWN"]
+      INITIAL = "IDLE"
+
+      SW_CANDIDATE_HOLD = 0.20   # s，开关候选值需持续这么久才确认为稳定按压（滤抖动）
+      REARM              = 0.30  # s，两次确认按压之间的最小间隔（防止刷屏式重触发）
+      RESP_TMO           = 0.60  # s，请求确认后，EPB_Sts 应在此内进入 Locking
+      NO_CAUSE_TMO       = 1.50  # s，既无 DspMsg 也无静止推断依据仍未动作 → 判 NO_VISIBLE_CAUSE
+      COMPLETE_TMO       = 5.0   # s，Locking 后应在此内到 Locked，否则单独提示
+
+      # -- 开关去抖：candidate/stable 两级，避免把双发送者 ~100ms 抖动当成按压 --
+      sw_cand = None; sw_cand_t = None; sw_stable = None
+      last_confirmed_press = None
+
+      # -- 事务：request_t 一旦置位就必须走到 Locking/终止才清空，
+      #    不与"当前 EPB_Sts 是否已经是 Locked"耦合（避免吞掉新请求） --
+      request_t = None
+      apply_seen_t = None       # 观测到 Locking 的时刻
+      reported_blocked = False
+      reported_noact = False
+      reported_complete_tmo = False
+
+      def is_standstill(std_signal, std_moving_str, std_still_str, raw):
+          if raw is None:
+              return None
+          if raw == std_still_str:
+              return True
+          if raw == std_moving_str:
+              return False
+          return None
+
+      def standstill_evidence(s):
+          # 冗余两腿：ESC 侧优先，ADCU 侧兜底；不一致时仍以"任一腿=静止"放宽判定，
+          # 因为这里只是"是否有静止证据"，不是精确一致性检查（一致性见 epb_health）
+          esc = is_standstill(None, "NO_VEHICLE_STANDSTILL", "VEHICLE_STANDSTILL",
+                               s.ESC_VehicleStandstill)
+          adcu = is_standstill(None, "Moving", "Standstill",
+                                s.WCBS_ADCU_VAP_VehicleStandstill)
+          if esc is True or adcu is True:
+              return True
+          if esc is False and adcu is False:
+              return False
+          return None   # 只有一腿或双腿缺失/矛盾 → 无法判定
+
+      def update(t, s, dt):
+          global sw_cand, sw_cand_t, sw_stable, last_confirmed_press
+          global request_t, apply_seen_t
+          global reported_blocked, reported_noact, reported_complete_tmo
+
+          sts = s.EPB_Sts
+          if sts is None:
+              return None
+          if sts == "Invalid":
+              reason("EPB_Sts=Invalid：反馈本身不可信，暂不做 Apply 判决")
+              return "APPLY_FEEDBACK_UNKNOWN"
+
+          # --- 开关去抖：candidate 变化就重新计时，稳定 SW_CANDIDATE_HOLD 才确认 ---
+          sw = s.CVC_EPB_SwitchSta
+          if sw != sw_cand:
+              sw_cand = sw; sw_cand_t = t
+          confirmed_press = False
+          if (sw_cand != sw_stable and sw_cand_t is not None
+                  and (t - sw_cand_t) >= SW_CANDIDATE_HOLD):
+              old = sw_stable
+              sw_stable = sw_cand
+              if (sw_stable == "Pressed" and old != "Pressed"
+                      and (last_confirmed_press is None
+                           or (t - last_confirmed_press) >= REARM)):
+                  confirmed_press = True
+                  last_confirmed_press = t
+
+          # 方向消歧：按压时若当前反馈已在 Locked/Locking，这次按压属于 Release 语义，
+          # 交给 epb_release 处理，这里不当作 Apply 请求（工程假设：单键切换式开关）
+          sw_is_apply_intent = confirmed_press and sts in ("Released", "Unknown")
+
+          m2s_req_edge = (s.changed("M2SApplyReleaseRequest")
+                           and s.M2SApplyReleaseRequest == "Request")
+          # M2S 无方向信息，仅当当前终态为 Released/Unknown 时才归为 Apply 请求的辅证
+          m2s_is_apply_intent = m2s_req_edge and sts in ("Released", "Unknown")
+
+          # --- 请求检测：与"当前终态判读"解耦，任何时刻都先看是否有新请求 ---
+          if (sw_is_apply_intent or m2s_is_apply_intent) and request_t is None:
+              request_t = t
+              apply_seen_t = None
+              reported_blocked = False; reported_noact = False
+              reported_complete_tmo = False
+              reason("检出 Apply 请求（来源=%s）：P键=%s、M2S=%s、EPB_Sts=%s、"
+                     "静止证据=%s、挡位=%s —— 等待判决"
+                     % ("SWITCH" if sw_is_apply_intent else "M2S",
+                        s.CVC_EPB_SwitchSta, s.M2SApplyReleaseRequest, sts,
+                        standstill_evidence(s), s.CVC_ACTGear))
+              return "APPLY_REQUESTED"
+
+          # --- 执行中 ---
+          if sts == "Locking":
+              if apply_seen_t is None:
+                  apply_seen_t = t
+                  reason("EPB_Sts 进入 Locking（%s）：静止证据=%s、主缸 %s bar"
+                         % ("请求后 %.2fs" % (t - request_t) if request_t else "无前置请求观测",
+                            standstill_evidence(s), s.WCBS_MainCylinderPress))
+              elif (t - apply_seen_t) >= COMPLETE_TMO and not reported_complete_tmo:
+                  reported_complete_tmo = True
+                  attempt("EPB_Sts 已 Locking %.1fs 仍未到 Locked" % (t - apply_seen_t))
+                  reason("Locking 持续过久：%.1fs 未见 Locked，ADCU 侧=%s，故障位=%s"
+                         % (t - apply_seen_t, s.WCBS_ADCU_VAP_EPBState, s.WCBS_EPB_Fault))
+              return "APPLYING"
+
+          # --- 完成 ---
+          if sts == "Locked":
+              if request_t is not None or apply_seen_t is not None:
+                  adcu = s.WCBS_ADCU_VAP_EPBState
+                  note = "" if adcu in (None, "Applied") else "（ADCU 侧=%s 不一致，见 epb_health）" % adcu
+                  reason("EPB 已 Locked（夹紧完成）%s" % note)
+              request_t = None; apply_seen_t = None
+              reported_blocked = False; reported_noact = False; reported_complete_tmo = False
+              return None   # 完成态不计为"需要关注"，交给 epb_health 做双反馈核对
+
+          # --- 请求已发出但未见 Locking：分级判定，不下确定结论 ---
+          if request_t is not None and sts in ("Released", "Unknown"):
+              wait = t - request_t
+              if wait < RESP_TMO:
+                  return None
+              dsp = s.EPB_SysDspMsgReq
+              if dsp not in (None, "Off"):
+                  if not reported_blocked:
+                      reported_blocked = True
+                      attempt("Apply 请求后 %.2fs 未见 Locking，仪表消息=%s" % (wait, dsp))
+                      reason("Apply 疑似被阻止（总线直接证据）：EPB_SysDspMsgReq=%s，"
+                             "EPB_Sts 停留在 %s" % (dsp, sts))
+                  return "APPLY_SUSPECTED_BLOCKED"
+
+              ss = standstill_evidence(s)
+              if ss is False:
+                  if not reported_blocked:
+                      reported_blocked = True
+                      attempt("Apply 请求后 %.2fs 未见 Locking，静止证据=非静止" % wait)
+                      reason("Apply 疑似被阻止（推断，非总线直接证据）：ESC_VehicleStandstill=%s、"
+                             "WCBS_ADCU_VAP_VehicleStandstill=%s 显示车辆非静止；安全屏障要求"
+                             "STATIONARY，内部 VehicleState 不在总线上，此处仅为据可观测信号的推断"
+                             % (s.ESC_VehicleStandstill, s.WCBS_ADCU_VAP_VehicleStandstill))
+                  return "APPLY_SUSPECTED_BLOCKED"
+
+              if wait >= NO_CAUSE_TMO and not reported_noact:
+                  reported_noact = True
+                  attempt("Apply 请求后 %.2fs：无 DspMsg、静止证据=%s（无法判定非静止），仍 %s"
+                          % (wait, ss, sts))
+                  reason("Apply 请求后 %.2fs 未见 Locking，且总线上找不到可解释的阻止证据"
+                         "（无仪表消息、静止证据不支持'被拒绝'这一推断）：疑执行层或总线不可见"
+                         "的内部判决，不臆测具体根因，需台架/内部日志进一步确认" % wait)
+                  return "APPLY_NO_VISIBLE_CAUSE"
+              return None
+
+          return None
+
+  # ===========================================================================
+  # EPB 释放 (Release) 全链路，含 DAR 自动释放候选路径
+  # ===========================================================================
+  - id: epb_release
+    name: "EPB 释放 Release (全链路, 含 DAR)"
+    description: >-
+      三种触发源：手动 P 键（当前处于 Locked 时视为 Release 意图）/ DAR 候选
+      （挡位稳定切入 D/R 且有制动介入证据，只是"候选条件"，不代表 ECU 已发出
+      内部 DAR 请求）/ M2S 请求镜像（无方向，需当前终态为 Locked 才归为 Release
+      辅证）。EPB_Sts: Locked→Releasing→Released。请求后未释放时，优先用
+      EPB_SysDspMsgReq（如 DAR_Nok_DoorOpen）；否则用 点火 ON 且(主缸压力/踏板
+      介入) 推断"驾驶员是否在场"（DriverPresent 的近似，非直接证据）。
+    signals:
+      - CVC_EPB_SwitchSta              # 请求：驾驶员 P 键
+      - CVC_ACTGear                     # 请求：DAR 候选（切 D/R）
+      - M2SApplyReleaseRequest         # 请求：MOD→ACT 内部请求镜像（无方向）
+      - EPB_Sts                        # 反馈：EPB 总状态
+      - WCBS_ADCU_VAP_EPBState         # 反馈：ADCU 侧（交叉验证）
+      - EPB_SysDspMsgReq               # 反馈：仪表消息（DAR_Nok_DoorOpen 等）
+      - EPB_SysWrnIndReq
+      - BMS_IGN_Sts                    # 上下文：点火（DriverPresent 前提之一，推断用）
+      - WCBS_MainCylinderPress         # 上下文：主缸压力（推断驾驶员在踩制动）
+      - WCBS_MainCylinderPressValid
+      - WCBS_BrkPedalPct               # 上下文：踏板开度（辅助推断制动介入）
+      - WCBS_BrkPedalValid
+      - WCBS_EPB_Fault
+      - EPB_Swch_Mafnc
+    code: |
+      ACTIVE_STATES = ["RELEASE_REQUESTED", "DAR_CANDIDATE", "RELEASING",
+                        "RELEASE_SUSPECTED_BLOCKED", "RELEASE_NO_VISIBLE_CAUSE",
+                        "RELEASE_FEEDBACK_UNKNOWN"]
+      INITIAL = "IDLE"
+
+      SW_CANDIDATE_HOLD = 0.20
+      GEAR_CANDIDATE_HOLD = 0.20
+      REARM        = 0.30
+      RESP_TMO     = 0.60
+      NO_CAUSE_TMO = 1.50
+      COMPLETE_TMO = 5.0
+      PRESS_ON     = 3.0   # bar，主缸压力判"驾驶员在踩制动"门限（工程近似，非精确算法）
+      PEDAL_ON     = 5.0   # %，踏板开度辅助门限
+
+      sw_cand = None; sw_cand_t = None; sw_stable = None
+      gear_cand = None; gear_cand_t = None; gear_stable = None
+      last_confirmed_press = None
+
+      request_t = None
+      request_source = None     # "SWITCH" / "DAR_CANDIDATE" / "M2S"
+      releasing_seen_t = None
+      reported_blocked = False
+      reported_noact = False
+      reported_complete_tmo = False
+
+      def brake_intervening(s):
+          p = s.WCBS_MainCylinderPress
+          if (p is not None and s.WCBS_MainCylinderPressValid in (None, "Valid")
+                  and float(p) >= PRESS_ON):
+              return True
+          ped = s.WCBS_BrkPedalPct
+          if (ped is not None and s.WCBS_BrkPedalValid in (None, "Valid")
+                  and float(ped) >= PEDAL_ON):
+              return True
+          return False
+
+      def driver_present_evidence(s):
+          ign = s.BMS_IGN_Sts
+          if ign is None:
+              return None
+          if ign != "ON":
+              return False
+          return brake_intervening(s)
+
+      def update(t, s, dt):
+          global sw_cand, sw_cand_t, sw_stable
+          global gear_cand, gear_cand_t, gear_stable, last_confirmed_press
+          global request_t, request_source, releasing_seen_t
+          global reported_blocked, reported_noact, reported_complete_tmo
+
+          sts = s.EPB_Sts
+          if sts is None:
+              return None
+          if sts == "Invalid":
+              reason("EPB_Sts=Invalid：反馈本身不可信，暂不做 Release 判决")
+              return "RELEASE_FEEDBACK_UNKNOWN"
+
+          # --- P 键去抖，方向消歧：仅当前终态为 Locked/Locking 时按压才算 Release 意图 ---
+          sw = s.CVC_EPB_SwitchSta
+          if sw != sw_cand:
+              sw_cand = sw; sw_cand_t = t
+          confirmed_press = False
+          if (sw_cand != sw_stable and sw_cand_t is not None
+                  and (t - sw_cand_t) >= SW_CANDIDATE_HOLD):
+              old = sw_stable
+              sw_stable = sw_cand
+              if (sw_stable == "Pressed" and old != "Pressed"
+                      and (last_confirmed_press is None
+                           or (t - last_confirmed_press) >= REARM)):
+                  confirmed_press = True
+                  last_confirmed_press = t
+          sw_is_release_intent = confirmed_press and sts in ("Locked", "Locking")
+
+          # --- 挡位去抖，DAR 候选：稳定切入 D/R 且有制动介入证据 ---
+          gear = s.CVC_ACTGear
+          if gear != gear_cand:
+              gear_cand = gear; gear_cand_t = t
+          gear_stable_dr = False
+          if (gear_cand != gear_stable and gear_cand_t is not None
+                  and (t - gear_cand_t) >= GEAR_CANDIDATE_HOLD):
+              gear_stable = gear_cand
+          if gear_stable in ("D", "R") and brake_intervening(s):
+              gear_stable_dr = True
+          dar_intent = gear_stable_dr and sts in ("Locked", "Locking")
+
+          m2s_req_edge = (s.changed("M2SApplyReleaseRequest")
+                           and s.M2SApplyReleaseRequest == "Request")
+          m2s_is_release_intent = m2s_req_edge and sts in ("Locked", "Locking")
+
+          if request_t is None:
+              src = None
+              if sw_is_release_intent:
+                  src = "SWITCH"
+              elif dar_intent:
+                  src = "DAR_CANDIDATE"
+              elif m2s_is_release_intent:
+                  src = "M2S"
+              if src is not None:
+                  request_t = t; request_source = src
+                  reported_blocked = False; reported_noact = False; reported_complete_tmo = False
+                  reason("检出 Release 请求（来源=%s）：P键=%s、挡位=%s(候选=%s)、"
+                         "点火=%s、主缸 %s bar、踏板 %s%% —— 等待判决"
+                         % (src, s.CVC_EPB_SwitchSta, s.CVC_ACTGear, gear_stable_dr,
+                            s.BMS_IGN_Sts, s.WCBS_MainCylinderPress, s.WCBS_BrkPedalPct))
+                  return "DAR_CANDIDATE" if src == "DAR_CANDIDATE" else "RELEASE_REQUESTED"
+
+          if sts == "Releasing":
+              if releasing_seen_t is None:
+                  releasing_seen_t = t
+                  reason("EPB_Sts 进入 Releasing（来源=%s）：点火=%s、主缸 %s bar"
+                         % (request_source, s.BMS_IGN_Sts, s.WCBS_MainCylinderPress))
+              elif (t - releasing_seen_t) >= COMPLETE_TMO and not reported_complete_tmo:
+                  reported_complete_tmo = True
+                  attempt("EPB_Sts 已 Releasing %.1fs 仍未到 Released" % (t - releasing_seen_t))
+                  reason("Releasing 持续过久：%.1fs 未见 Released，ADCU 侧=%s"
+                         % (t - releasing_seen_t, s.WCBS_ADCU_VAP_EPBState))
+              return "RELEASING"
+
+          if sts == "Released":
+              if request_t is not None or releasing_seen_t is not None:
+                  adcu = s.WCBS_ADCU_VAP_EPBState
+                  note = "" if adcu in (None, "Released") else "（ADCU 侧=%s 不一致，见 epb_health）" % adcu
+                  reason("EPB 已 Released（释放完成，来源=%s）%s" % (request_source, note))
+              request_t = None; request_source = None; releasing_seen_t = None
+              reported_blocked = False; reported_noact = False; reported_complete_tmo = False
+              return None
+
+          if request_t is not None and sts in ("Locked", "Locking"):
+              wait = t - request_t
+              if wait < RESP_TMO:
+                  return None
+              dsp = s.EPB_SysDspMsgReq
+              if dsp not in (None, "Off"):
+                  if not reported_blocked:
+                      reported_blocked = True
+                      attempt("Release 请求(%s)后 %.2fs 未见 Releasing，仪表消息=%s"
+                              % (request_source, wait, dsp))
+                      reason("Release 疑似被阻止（总线直接证据）：EPB_SysDspMsgReq=%s，"
+                             "EPB_Sts 停留在 %s" % (dsp, sts))
+                  return "RELEASE_SUSPECTED_BLOCKED"
+
+              dp = driver_present_evidence(s)
+              if dp is False:
+                  if not reported_blocked:
+                      reported_blocked = True
+                      attempt("Release 请求(%s)后 %.2fs 未见 Releasing，DriverPresent 证据=否"
+                              % (request_source, wait))
+                      reason("Release 疑似被阻止（推断，非总线直接证据）：点火=%s、主缸 %s bar"
+                             "(valid=%s)、踏板 %s%%，不满足'点火ON 且 制动介入'这一 DriverPresent"
+                             "近似判据；内部 DriverState 不在总线上，此处仅为推断"
+                             % (s.BMS_IGN_Sts, s.WCBS_MainCylinderPress,
+                                s.WCBS_MainCylinderPressValid, s.WCBS_BrkPedalPct))
+                  return "RELEASE_SUSPECTED_BLOCKED"
+
+              if wait >= NO_CAUSE_TMO and not reported_noact:
+                  reported_noact = True
+                  attempt("Release 请求(%s)后 %.2fs：无 DspMsg、DriverPresent 证据=%s（无法判定为否），仍 %s"
+                          % (request_source, wait, dp, sts))
+                  reason("Release 请求后 %.2fs 未见 Releasing，且总线上找不到可解释的阻止证据："
+                         "疑执行层或总线不可见的内部判决，不臆测具体根因，需台架/内部日志进一步确认"
+                         % wait)
+                  return "RELEASE_NO_VISIBLE_CAUSE"
+              return None
+
+          return None
+
+  # ===========================================================================
+  # EPB 故障 / 开关健康度 / 双反馈一致性 —— 独立处境，排查也可先看这条
+  # ===========================================================================
+  - id: epb_health
+    name: "EPB 故障 / 开关健康度 / 反馈一致性"
+    description: >-
+      与某一次 Apply/Release 请求无关的独立处境：①WCBS_EPB_Fault / EPB_Swch_Mafnc
+      故障位；②EPB_SysDspMsgReq 非 Off 的仪表告警文本；③EPB_Sts 与
+      WCBS_ADCU_VAP_EPBState 两份反馈的稳态映射一致性（Released/Locked/
+      Releasing/Locking 对 Released/Applied/Releasing/Applying，允许短暂
+      传播延迟，不做逐帧比较）；④P 键高频抖动作为双发送者旁证。
+    signals:
+      - WCBS_EPB_Fault
+      - EPB_Swch_Mafnc
+      - EPB_SysDspMsgReq
+      - EPB_SysWrnIndReq
+      - EPB_SysStatIndReq
+      - EPB_Sts
+      - WCBS_ADCU_VAP_EPBState
+      - CVC_EPB_SwitchSta
+      - EPB_CDPActive
+    code: |
+      ACTIVE_STATES = ["FAULT", "WARNING", "STATE_MISMATCH", "SW_JITTER"]
+      INITIAL = "OK"
+
+      MISMATCH_HOLD = 1.0   # s，两份反馈不一致须持续这么久才报（滤过渡态错拍）
+      JITTER_WIN    = 1.0   # s
+      JITTER_MIN    = 6     # 该窗口内边沿次数达到才判抖动
+
+      # EPB_Sts -> 期望的 WCBS_ADCU_VAP_EPBState（终态之间的映射，过渡态不做强校验）
+      EXPECT = {"Released": "Released", "Locked": "Applied",
+                "Releasing": "Releasing", "Locking": "Applying"}
+
+      mismatch_since = None
+      mismatch_reported = False
+      edge_hist = []     # 最近若干次 CVC_EPB_SwitchSta 边沿时间戳
+      prev_sw = None
+      jitter_reported_until = 0.0
+
+      def update(t, s, dt):
+          global mismatch_since, mismatch_reported
+          global edge_hist, prev_sw, jitter_reported_until
+
+          # --- 故障优先（正交事件，不覆盖下面的一致性/抖动检查，只是优先返回态）---
+          if s.WCBS_EPB_Fault == "Error" or s.EPB_Swch_Mafnc == "Error":
+              reason("EPB 故障：WCBS_EPB_Fault=%s、EPB_Swch_Mafnc=%s、EPB_Sts=%s、DspMsg=%s"
+                     % (s.WCBS_EPB_Fault, s.EPB_Swch_Mafnc, s.EPB_Sts, s.EPB_SysDspMsgReq))
+              return "FAULT"
+
+          dsp = s.EPB_SysDspMsgReq
+          if dsp not in (None, "Off") and s.changed("EPB_SysDspMsgReq"):
+              reason("EPB 仪表告警：EPB_SysDspMsgReq=%s（WrnInd=%s, StatInd=%s）"
+                     % (dsp, s.EPB_SysWrnIndReq, s.EPB_SysStatIndReq))
+              return "WARNING"
+
+          # --- 双反馈一致性（终态间比较，过渡态双方都在变化时跳过） ---
+          sts = s.EPB_Sts
+          adcu = s.WCBS_ADCU_VAP_EPBState
+          if sts in EXPECT and adcu is not None:
+              ok = (adcu == EXPECT[sts])
+              if not ok:
+                  if mismatch_since is None:
+                      mismatch_since = t
+                  elif (t - mismatch_since) >= MISMATCH_HOLD and not mismatch_reported:
+                      mismatch_reported = True
+                      reason("双反馈不一致持续 ≥%.1fs：EPB_Sts=%s（期望 ADCU=%s），"
+                             "实际 WCBS_ADCU_VAP_EPBState=%s —— 疑映射错误或报文丢失"
+                             % (MISMATCH_HOLD, sts, EXPECT[sts], adcu))
+                      return "STATE_MISMATCH"
+              else:
+                  mismatch_since = None
+                  mismatch_reported = False
+
+          # --- P 键抖动旁证（双发送者场景，类比 EP35 carmode_bus） ---
+          sw = s.CVC_EPB_SwitchSta
+          if sw != prev_sw:
+              edge_hist.append(t)
+              edge_hist[:] = [x for x in edge_hist if t - x <= JITTER_WIN]
+              prev_sw = sw
+              if len(edge_hist) >= JITTER_MIN and t >= jitter_reported_until:
+                  jitter_reported_until = t + JITTER_WIN
+                  attempt("CVC_EPB_SwitchSta 在 %.1fs 内边沿 %d 次" % (JITTER_WIN, len(edge_hist)))
+                  reason("检出 P 键高频抖动：%.1fs 内 %d 次翻转，疑同一 CAN ID 多发送者/机械抖动，"
+                         "Apply/Release 判决已做去抖，此处仅作旁证" % (JITTER_WIN, len(edge_hist)))
+                  return "SW_JITTER"
+
+          if mismatch_since is None and (dsp in (None, "Off")):
+              return "OK"
+          return None

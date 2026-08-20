@@ -1,0 +1,417 @@
+# =============================================================================
+# EP35 开关链路功能规格 —— AVH / HDC / "ESC-TCS off" 三个开关问题
+#
+# 适用日志: LogData/20260818_EP35_signal.blf   (单通道 CAN，68.0 s，192252 帧)
+# 适用 DBC : samples/03_CCAN_EP_v2.1.0_20260417-MOD.dbc
+#
+# -----------------------------------------------------------------------------
+# 规格的组织方式：一个 function = 一个完整功能，不是一个信号
+# -----------------------------------------------------------------------------
+# 排查时想看的是"这个功能经历了什么"，不是"某个 bit 翻了多少次"。所以：
+#
+#   * 每个 function 覆盖一条完整链路：驾驶员请求 → 总线传输 → WCBS 判决 →
+#     对外状态 → 上下文（车速/压力/EPB/故障位），signals 段把它们**按
+#     请求→反馈→上下文的顺序**全列出来，点一下功能按钮整组进 Graphics。
+#   * 状态机吐出的是功能层面的处境（OFF / STANDBY / REQ_IGNORED / …），
+#     配合下方事件栏就是一条可读的事件历程。
+#   * 开关位在双发送者场景下会以 ~100 ms 反复翻转。请求值一律先过
+#     Stable(去抖) 再参与判决 —— 否则光 HDC 一个信号就能刷出 663 条
+#     "进入/退出"，把真正的判决淹掉。
+#
+# 四个 function：
+#   carmode_bus   0x447 开关通道健康度（三个开关共用的根因层，先看这个）
+#   avh           AVH 全链路
+#   hdc           HDC 全链路
+#   esc_tcs       ESC-OFF / TCS-OFF 全链路
+#
+# -----------------------------------------------------------------------------
+# 背景：三个开关全部承载在同一条报文里
+# -----------------------------------------------------------------------------
+#   0x447 MHU_CarMode_Switch (sender=CVC_C, 200 ms, E2E: CRC8-SAE-J1850 + Alive)
+#       ├─ MHU_AVH_Sw          0=No Action 1=ON 2=OFF 3=Reserved
+#       ├─ MHU_HDC_Switch      0=OFF 1=ON 3=Signal Invalid
+#       └─ MHU_ESC_TCS_Switch  0=Normal 1=Traction Mode OFF 2=ESC-OFF 3=Signal Invalid
+#   反馈侧: 0x230 WCBS_VAFS（AVH/HDC 状态）、0x132 WCBS_ESC_Status（ESC/TCS 使能）
+#   三个开关"同时出问题"本身就是线索：故障在共用的 0x447 通路上，而不在
+#   AVH / HDC / ESC 三个功能各自的实现里。
+#
+# -----------------------------------------------------------------------------
+# EP35 日志实测结论
+# -----------------------------------------------------------------------------
+#   0x447 是全日志唯一一条 AliveCounter 断裂的报文：679/681 帧断裂，其余 61 条
+#   带 Alive 的报文均为 0/N。拆分后是两路各自 200 ms、各自 +1 递增的独立计数器：
+#       Stream A  333 帧  全部 is_rx=True   → 车上真实 CVC_C/MHU 网关（驾驶员输入）
+#                 AVH=ON, HDC=OFF, ESC_TCS 在 Normal / Traction Mode OFF / ESC-OFF 间变化
+#       Stream B  348 帧  340 帧 is_rx=False→ 记录设备自身（CANoe 残余总线/面板节点）
+#                 AVH=ON, HDC=ON, ESC_TCS=Normal 恒定
+#   两路 CRC 各自都算得对（CRC8 poly=0x1D init=0xFF xorout=0xFF, DataID=0x81）——
+#   两个节点都正确实现了 E2E，冲突不是数据损坏，而是"同一 CAN ID 双发送者"。
+#
+#   两路时钟差约 0.25%（2.5 ms/s），相位漂移在 t≈31.9 s 交叉，接收端"谁后到谁
+#   生效"的赢家换人：
+#       t<31.9  A 后到 → 驾驶员生效
+#           19.228 A:ESC-OFF→Normal      ⇒ 19.411 EscEnableSts Disabled→Enabled ✔
+#           28.006 A:Normal→TractionOFF  ⇒ 28.211 TcsEnableSts Enabled→Disabled ✔
+#           31.797 A:TractionOFF→Normal  ⇒ 31.811 TcsEnableSts Disabled→Enabled ✔
+#       t>31.9  B 后到 → 工具覆盖驾驶员
+#           31.911 HDC_SwitchSts OFF→ON（B 的 HDC=ON 被锁存，驾驶员一直发 OFF）✘
+#           34.390 A:ESC-OFF        ⇒ EscEnableSts 始终 Enabled，请求被忽略      ✘
+#           38.978 A:TractionOFF    ⇒ TcsEnableSts 始终 Enabled，请求被忽略      ✘
+#
+#   归因: CF（配置/测试台架问题），不是 WCBS 代码缺陷。
+#         处置: 关闭记录 PC 上 0x447 MHU_CarMode_Switch 的仿真/面板发送节点后重测。
+#
+#   AVH 补充: 车辆全程静止、主缸压力 0.28 bar（Valid，未踩制动）、EPB_Sts=Locked，
+#         因此 WCBS_AVH_Status 停在 "AVH Standby" 属合理行为，本日志不足以判定
+#         AVH 激活逻辑有问题。真正暴露的是 MHU_AVH_Sw 全程恒为 "ON" 68 s 未回
+#         "No Action"，违反点动语义：边沿触发的实现永远收不到新上升沿，
+#         且 "OFF"(2) 永远发不出去。
+#
+# -----------------------------------------------------------------------------
+# 约定
+#   * 事件类型：▲进入 = 进入异常态，▼退出 = 异常解除，◆变化 = 正常状态迁移。
+#     （由各 function 的 ACTIVE_STATES 决定，异常态才算"激活"。）
+#   * 带 VAL_ 表的信号在 canprobe 中解码为枚举**名字符串**，
+#     所以比较值写 "ESC-OFF" 而不是 2。
+# =============================================================================
+
+functions:
+
+  # ===========================================================================
+  # 0x447 开关通道健康度 —— 三个开关共用的根因层，排查从这里开始
+  # ===========================================================================
+  - id: carmode_bus
+    name: "0x447 开关通道 (AVH/HDC/ESC-TCS 共用)"
+    description: >-
+      三个开关命令共用的传输通道。逐帧跟踪 AliveCounter：把每帧归入某条
+      "上一个值 +1" 的轨道，若同时存在 ≥2 条各自连续递增的轨道，说明同一个
+      CAN ID 有多个节点在发，接收端拿到的是两组命令的交织，谁最后到谁生效。
+      三个开关同时失灵时，先看这条 —— 它若报 DUAL_TX，下面三个功能的异常
+      都是它的后果，不必再逐个怀疑 WCBS 实现。
+    signals:
+      - MHU_AVH_Sw
+      - MHU_HDC_Switch
+      - MHU_ESC_TCS_Switch
+      - ALIVE_MHU_CarMode_Switch
+      - CRC_MHU_CarMode_Switch
+    code: |
+      ACTIVE_STATES = ["E2E_BREAK", "DUAL_TX"]
+      INITIAL = "OK"
+
+      ALIVE   = "ALIVE_MHU_CarMode_Switch"
+      MOD     = 15          # 该报文 Alive 取值实测 0..14
+      STALE   = 1.0         # 超过 1 s 未更新的轨道视为消失
+      MIN_HIT = 5           # 一条轨道至少连续命中 5 帧才算真实发送者
+      TOL     = 3           # 允许 3 次偶发断裂后才判 E2E 故障
+
+      tracks  = []          # 每条轨道: [last_alive, hits, last_t]
+      prev_v  = None
+      breaks  = 0
+      total   = 0
+      state   = "OK"
+
+      def update(t, s, dt):
+          global tracks, prev_v, breaks, total, state
+          if state == "DUAL_TX" or not s.changed(ALIVE):
+              return None
+          v = s[ALIVE]
+          if v is None:
+              return None
+          v = int(v)
+          total += 1
+
+          # --- 轨道分裂：同一 ID 上有几条各自 +1 的计数器 ---
+          hit = None
+          for tr in tracks:
+              if (tr[0] + 1) % MOD == v and (t - tr[2]) < STALE:
+                  hit = tr
+                  break
+          if hit is None:
+              tracks = [tr for tr in tracks if (t - tr[2]) < STALE]
+              tracks.append([v, 1, t])
+          else:
+              hit[0], hit[1], hit[2] = v, hit[1] + 1, t
+          live = [tr for tr in tracks if tr[1] >= MIN_HIT and (t - tr[2]) < STALE]
+
+          if len(live) >= 2:
+              state = "DUAL_TX"
+              reason("检出 %d 条独立递增的 AliveCounter 轨道(命中 %s) → 同一 CAN ID 存在多个发送者；"
+                     "AVH=%s HDC=%s ESC_TCS=%s 三个开关命令都在被交织覆盖，谁最后到谁生效"
+                     % (len(live), [tr[1] for tr in live],
+                        s.MHU_AVH_Sw, s.MHU_HDC_Switch, s.MHU_ESC_TCS_Switch))
+              return "DUAL_TX"
+
+          # --- 接收端视角的 E2E 序列检查（双发送者的直接后果）---
+          out = None
+          if prev_v is not None and (prev_v + 1) % MOD != v:
+              breaks += 1
+              if state == "OK" and breaks >= TOL:
+                  state = "E2E_BREAK"
+                  reason("AliveCounter 断裂 %d→%d（累计 %d/%d 帧）→ 接收端 E2E 序列检查失败，"
+                         "开关命令会被丢弃或替换为默认值" % (prev_v, v, breaks, total))
+                  out = "E2E_BREAK"
+          prev_v = v
+          return out
+
+  # ===========================================================================
+  # AVH 全链路
+  # ===========================================================================
+  - id: avh
+    name: "AVH 自动驻车 (全链路)"
+    description: >-
+      驾驶员 AVH 开关 → 0x447 → WCBS 判决 → WCBS_AVH_Status，外加决定能否
+      进 Active 的上下文（车速/静止/主缸压力/EPB）。状态机给出 AVH 当下的处境；
+      停在 Standby 时 reason 里直接列出阻塞项，用来区分"AVH 逻辑有问题"和
+      "根本不满足接管条件"。
+    signals:
+      - MHU_AVH_Sw                    # 请求
+      - WCBS_AVH_Status               # 反馈
+      - WCBS_Avh_Available
+      - WCBS_AVH_DispMsg
+      - WCBS_MainCylinderPress        # 上下文：能否进 Active
+      - ESC_VehicleStandstill
+      - WCBS_VehicleSpeed
+      - EPB_Sts
+      - WCBS_MainCylinderPressValid
+    code: |
+      ACTIVE_STATES = ["SW_STUCK", "REQ_IGNORED", "FAULT"]
+      INITIAL = None
+
+      HOLD       = 0.3      # 请求去抖：值稳定这么久才算一次真实请求
+      RESP_TMO   = 0.5      # 稳定请求超过这么久没被响应 → 判忽略
+      STUCK_TMO  = 3.0      # 点动命令保持这么久不回 No Action → 判语义违规
+      HOLD_PRESS = 3.0      # bar，判定"驾驶员正在踩制动"的工程近似门限
+
+      # 请求去抖器：双发送者场景下开关位会 ~100 ms 反复翻转，不去抖会刷屏
+      cand = None; cand_t = None; stable = None; stable_t = None
+      sw_on_t = None        # MHU_AVH_Sw 保持在 ON/OFF（非 No Action）的起点
+
+      def blockers(s):
+          why = []
+          p = s.WCBS_MainCylinderPress
+          if s.WCBS_MainCylinderPressValid != "Valid":
+              why.append("主缸压力无效(%s)" % s.WCBS_MainCylinderPressValid)
+          elif p is None or float(p) < HOLD_PRESS:
+              why.append("主缸压力 %s bar < %.1f，驾驶员未踩制动" % (p, HOLD_PRESS))
+          if s.ESC_VehicleStandstill != "VEHICLE_STANDSTILL":
+              why.append("车辆未静止(车速 %s)" % s.WCBS_VehicleSpeed)
+          if s.EPB_Sts == "Locked":
+              why.append("EPB 已 Locked，AVH 无需接管")
+          return why
+
+      def update(t, s, dt):
+          global cand, cand_t, stable, stable_t, sw_on_t
+          sw = s.MHU_AVH_Sw
+          st = s.WCBS_AVH_Status
+          if sw is None or st is None:
+              return None      # 请求或反馈还没收到第一帧，先不下结论
+
+          if sw != cand:
+              cand, cand_t = sw, t
+          if cand != stable and cand_t is not None and (t - cand_t) >= HOLD:
+              stable, stable_t = cand, t
+
+          # 点动语义：ON/OFF 是按键命令，松手应回 No Action
+          if sw in ("ON", "OFF"):
+              if sw_on_t is None:
+                  sw_on_t = t
+          else:
+              sw_on_t = None
+
+          if s.WCBS_Avh_Available == "AVH Not Available" or st == "AVH Failure":
+              reason("AVH 不可用/故障：Available=%s Status=%s DispMsg=%s"
+                     % (s.WCBS_Avh_Available, st, s.WCBS_AVH_DispMsg))
+              return "FAULT"
+
+          if sw_on_t is not None and (t - sw_on_t) >= STUCK_TMO:
+              reason("MHU_AVH_Sw 持续为 '%s' 已 %.1f s 未回 'No Action'（DBC 定义为点动命令）→ "
+                     "边沿触发的开关逻辑收不到新上升沿，OFF 也发不出去；此时 AVH_Status=%s"
+                     % (sw, t - sw_on_t, st))
+              return "SW_STUCK"
+
+          # 稳定的 ON 请求但 AVH 仍是 Off → 命令没被采纳
+          if (stable == "ON" and st == "AVH Off"
+                  and stable_t is not None and (t - stable_t) >= RESP_TMO):
+              reason("稳定的 AVH ON 请求已 %.2f s，WCBS_AVH_Status 仍为 AVH Off" % (t - stable_t))
+              return "REQ_IGNORED"
+
+          if st == "AVH Active":
+              reason("AVH 接管保持车辆（车速 %s，主缸 %s bar）"
+                     % (s.WCBS_VehicleSpeed, s.WCBS_MainCylinderPress))
+              return "ACTIVE"
+          if st == "AVH Standby":
+              why = blockers(s)
+              reason("AVH 已开启待机，未进 Active" + ("；阻塞项: " + "；".join(why) if why else "（无可识别阻塞项，需查激活逻辑）"))
+              return "STANDBY"
+          reason("AVH 关闭（开关=%s）" % sw)
+          return "OFF"
+
+  # ===========================================================================
+  # HDC 全链路
+  # ===========================================================================
+  - id: hdc
+    name: "HDC 陡坡缓降 (全链路)"
+    description: >-
+      驾驶员 HDC 开关 → 0x447 → WCBS_HDC_SwitchSts / HDCCtrlsts，外加可用性与
+      故障告警、以及决定能否真正建压的车速。重点是把"请求"和"反馈"摆在一起：
+      反馈说 ON 而驾驶员请求的是 OFF，说明这个 ON 不是驾驶员按出来的。
+    signals:
+      - MHU_HDC_Switch                # 请求
+      - WCBS_HDC_SwitchSts            # 反馈：开关状态
+      - WCBS_HDCCtrlsts               # 反馈：控制状态
+      - WCBS_HDC_available
+      - WCBS_HDC_displayWarnMsg
+      - WCBS_VehicleSpeed
+      - ESC_SlopeGrade
+      - WCBS_DTCFailure
+    code: |
+      # 冲突态按 WCBS 当前锁存值分成两个状态，这样"命令一直在冲突"和
+      # "冲突期间 WCBS 忽然把 HDC 锁存成 ON 了"能各自成为一条事件
+      ACTIVE_STATES = ["SW_CONFLICT_OFF", "SW_CONFLICT_ON", "REQ_IGNORED", "NOT_AVAILABLE"]
+      INITIAL = None
+
+      HOLD     = 0.3        # 请求去抖
+      RESP_TMO = 0.5        # 稳定请求超时未响应
+      FLIP_WIN = 1.0        # 同一窗口内既见 ON 又见 OFF → 人手按不出这种频率
+
+      cand = None; cand_t = None; stable = None; stable_t = None
+      on_t = None; off_t = None     # 请求位最近一次为 ON / OFF 的时刻
+
+      def update(t, s, dt):
+          global cand, cand_t, stable, stable_t, on_t, off_t
+          req = s.MHU_HDC_Switch
+          sts = s.WCBS_HDC_SwitchSts
+          if req is None or sts is None:
+              return None      # 请求或反馈还没收到第一帧，先不下结论
+
+          if req == "ON":
+              on_t = t
+          elif req == "OFF":
+              off_t = t
+          if req != cand:
+              cand, cand_t = req, t
+          if cand != stable and cand_t is not None and (t - cand_t) >= HOLD:
+              stable, stable_t = cand, t
+
+          if (s.WCBS_HDC_available == "HDC Not Available"
+                  or s.WCBS_HDC_displayWarnMsg != "No warning"):
+              reason("HDC 不可用：available=%s warn=%s DTC=%s"
+                     % (s.WCBS_HDC_available, s.WCBS_HDC_displayWarnMsg, s.WCBS_DTCFailure))
+              return "NOT_AVAILABLE"
+
+          # 判据看的是「请求位本身在翻转」，不是「请求与反馈某一刻不一致」。
+          # 后者在双发送者下每 ~100 ms 真假交替，会把一条结论抖成几十条事件。
+          flipping = (on_t is not None and off_t is not None
+                      and abs(on_t - off_t) <= FLIP_WIN
+                      and (t - max(on_t, off_t)) <= FLIP_WIN)
+          if flipping:
+              reason("MHU_HDC_Switch 在 %.1fs 窗口内既出现 ON 又出现 OFF（人手按不出这种频率）→ "
+                     "0x447 上有多个发送者在交织下发；WCBS 当前锁存 %s，控制状态 %s"
+                     % (FLIP_WIN, sts, s.WCBS_HDCCtrlsts))
+              return "SW_CONFLICT_ON" if sts == "HDC ON" else "SW_CONFLICT_OFF"
+
+          if (stable == "ON" and sts == "HDC OFF"
+                  and stable_t is not None and (t - stable_t) >= RESP_TMO):
+              reason("稳定的 HDC ON 请求已 %.2f s，反馈仍为 HDC OFF（HDC 可用且无故障）"
+                     % (t - stable_t))
+              return "REQ_IGNORED"
+
+          if s.WCBS_HDCCtrlsts == "Active braking":
+              reason("HDC 主动建压（车速 %s，坡度 %s%%）" % (s.WCBS_VehicleSpeed, s.ESC_SlopeGrade))
+              return "BRAKING"
+          if sts == "HDC ON":
+              reason("HDC 已开启未建压（稳定请求=%s，车速 %s，坡度 %s%%）"
+                     % (stable, s.WCBS_VehicleSpeed, s.ESC_SlopeGrade))
+              return "ON"
+          reason("HDC 关闭（稳定请求=%s）" % stable)
+          return "OFF"
+
+  # ===========================================================================
+  # ESC-OFF / TCS-OFF 全链路
+  # ===========================================================================
+  - id: esc_tcs
+    name: "ESC-OFF / TCS-OFF (全链路)"
+    description: >-
+      驾驶员三档开关（Normal / Traction Mode OFF / ESC-OFF）→ 0x447 →
+      ESC_EscEnableSts / ESC_TcsEnableSts，外加故障位与 HDC 状态。
+      带上 HDC 是因为存在设计内互锁：HDC 依赖 ESC 制动通道，HDC 激活时拒绝
+      ESC-OFF 是正确行为 —— 不把它摆进来就会把"被合理拒绝"误判成"命令丢了"。
+    signals:
+      - MHU_ESC_TCS_Switch            # 请求
+      - ESC_EscEnableSts              # 反馈
+      - ESC_TcsEnableSts
+      - ESC_EscCtrlActv
+      - ESC_TcsCtrlActv
+      - ESC_EscFlgFlt
+      - ESC_TcsFlgFlt
+      - WCBS_HDC_SwitchSts            # 互锁项
+      - ESC_DTC_Active
+    code: |
+      ACTIVE_STATES = ["REQ_IGNORED", "FAULT"]
+      INITIAL = None
+
+      HOLD     = 0.3
+      RESP_TMO = 0.5
+      GAP      = 1.0        # 请求消失超过这么久才算驾驶员松手
+
+      cand = None; cand_t = None; stable = None; stable_t = None
+      req_since = None; last_req = None; req_kind = None
+
+      def wanted(sw):
+          # 该档位期望把哪个功能关掉
+          if sw == "ESC-OFF":
+              return ("ESC", "ESC_EscEnableSts")
+          if sw == "Traction Mode OFF":
+              return ("TCS", "ESC_TcsEnableSts")
+          return (None, None)
+
+      def update(t, s, dt):
+          global cand, cand_t, stable, stable_t, req_since, last_req, req_kind
+          sw = s.MHU_ESC_TCS_Switch
+          if sw is None or s.ESC_EscEnableSts is None:
+              return None      # 请求或反馈还没收到第一帧，先不下结论
+
+          if sw != cand:
+              cand, cand_t = sw, t
+          if cand != stable and cand_t is not None and (t - cand_t) >= HOLD:
+              stable, stable_t = cand, t
+
+          if s.ESC_EscFlgFlt == "Failure" or s.ESC_TcsFlgFlt == "Failure":
+              reason("ESC/TCS 故障：EscFlt=%s TcsFlt=%s DTC=%s（此时拒绝关闭请求属保护行为）"
+                     % (s.ESC_EscFlgFlt, s.ESC_TcsFlgFlt, s.ESC_DTC_Active))
+              return "FAULT"
+
+          # "关闭"请求用反复出现判据：被另一个发送者以 Normal 覆盖时，
+          # 驾驶员的 ESC-OFF 每 200 ms 才露一次头，连续保持的计时会被清零
+          kind, fb = wanted(sw)
+          if kind:
+              if req_kind != kind:
+                  req_kind, req_since = kind, t
+              last_req = t
+          k2, fb2 = (req_kind, "ESC_EscEnableSts" if req_kind == "ESC" else "ESC_TcsEnableSts")
+          acked = k2 is not None and s[fb2] == "Disabled"
+          gone = last_req is not None and (t - last_req) > GAP
+          if acked or gone:
+              req_kind, req_since, last_req = None, None, None
+
+          if (req_kind and req_since is not None and (t - req_since) >= RESP_TMO):
+              note = ""
+              if s.WCBS_HDC_SwitchSts == "HDC ON":
+                  note = "；可解释抑制项: HDC 已开启（HDC 依赖 ESC 制动通道，互锁属设计内行为）"
+              else:
+                  note = "；无任何可解释的抑制项 → 命令未被 WCBS 接收"
+              reason("%s 关闭请求反复出现已 %.2f s，%s 仍为 Enabled%s"
+                     % (req_kind, t - req_since, fb2, note))
+              return "REQ_IGNORED"
+
+          esc_off = s.ESC_EscEnableSts == "Disabled"
+          tcs_off = s.ESC_TcsEnableSts == "Disabled"
+          if esc_off:
+              reason("ESC 已关闭（开关瞬时值=%s，TCS=%s）" % (sw, "Disabled" if tcs_off else "Enabled"))
+              return "ESC_OFF"
+          if tcs_off:
+              reason("TCS 已关闭（开关瞬时值=%s，ESC 仍 Enabled）" % sw)
+              return "TCS_OFF"
+          reason("ESC/TCS 均使能（开关瞬时值=%s，EscActv=%s TcsActv=%s）"
+                 % (sw, s.ESC_EscCtrlActv, s.ESC_TcsCtrlActv))
+          return "NORMAL"

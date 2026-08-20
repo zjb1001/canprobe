@@ -13,6 +13,14 @@ TIER1_CHECKS = ("bus_load", "periodicity", "node_offline", "bus_silence")
 TIER2_CHECKS = ("error_frame", "error_state_machine")
 TIER3_CHECKS = ("baud_mismatch", "termination_wiring")
 
+# 报文级体检：纯帧级事实，任何日志格式都做得了（不需要 DBC）
+MSG_CHECKS = ("msg_absent", "msg_period", "msg_gap", "msg_burst", "msg_stop",
+              "msg_late", "msg_dlc", "msg_multichannel", "msg_payload_stuck",
+              "msg_error_nearby", "msg_raw_counter")
+# 信号级体检：必须解得开这条报文，即需要配套 DBC
+SIG_CHECKS = ("msg_decode", "sig_constant", "sig_stuck", "sig_range",
+              "sig_enum_invalid", "sig_counter", "sig_checksum")
+
 
 @dataclass
 class Capabilities:
@@ -23,11 +31,12 @@ class Capabilities:
     bus_status: bool = False
     directions: bool = False
     channels: int = 1
+    has_dbc: bool = False
 
     @classmethod
-    def detect(cls, events, channels: int) -> "Capabilities":
+    def detect(cls, events, channels: int, has_dbc: bool = False) -> "Capabilities":
         """从解析出的通信层事件探测能力（实测探测，非文档假定）。"""
-        cap = cls(channels=channels)
+        cap = cls(channels=channels, has_dbc=has_dbc)
         for e in events:
             if e.kind == "error":
                 cap.error_frames = True
@@ -46,12 +55,15 @@ class Capabilities:
             "bus_status": self.bus_status,
             "directions": self.directions,
             "channels": self.channels,
+            "has_dbc": self.has_dbc,
             "available_checks": self.available_checks(),
             "unavailable_checks": self.unavailable_checks(),
         }
 
     def available_checks(self) -> list[str]:
-        checks = list(TIER1_CHECKS)
+        checks = list(TIER1_CHECKS) + list(MSG_CHECKS)
+        if self.has_dbc:
+            checks += list(SIG_CHECKS)
         if self.error_frames:
             checks.append("error_frame")
             # Tier 3 推断层需要错误帧签名才能推理，故同 error_frames 一起可用
@@ -62,13 +74,15 @@ class Capabilities:
 
     def unavailable_checks(self) -> list[dict]:
         out = []
-        for c in TIER2_CHECKS + TIER3_CHECKS:
+        for c in TIER2_CHECKS + TIER3_CHECKS + SIG_CHECKS:
             if c not in self.available_checks():
                 out.append({"check": c, "reason": self._reason(c)})
         return out
 
     @staticmethod
     def _reason(check: str) -> str:
+        if check in SIG_CHECKS:
+            return "信号级检查需要配套 DBC（当前未加载，只能给帧级结论）"
         if check == "error_frame":
             return "日志未记录错误帧（如 .csv/.json 仅含数据帧）"
         if check == "error_state_machine":

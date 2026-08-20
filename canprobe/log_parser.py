@@ -386,12 +386,43 @@ def parse_blf(path: str) -> list[Frame]:
     return frames
 
 
+def blf_arrays(path: str):
+    """BLF → 紧凑 NumPy 数组（快速通道）。
+
+    走 :mod:`canprobe.blf_fast`，跳过逐帧 ``Message`` / :class:`Frame` 对象。
+    快速通道解析不了时返回 ``None``，由调用方回退到 :func:`parse_blf`。
+    """
+    from .blf_fast import BlfFastError, read_blf_arrays
+
+    try:
+        return read_blf_arrays(path)
+    except BlfFastError:
+        return None
+    except Exception:
+        # 快速通道任何意外都不该让日志打不开——回退到 python-can
+        return None
+
+
+# CAN-FD DLC code → payload length in bytes. For 0..8 the code *is* the length;
+# 9..15 are the FD escape codes. MF4 stores the raw 4-bit code in
+# ``CAN_DataFrame.DLC``, so using it directly as a byte count silently truncates
+# every FD frame — a 24-byte WCBS_Info arrives as 12 bytes and cantools then
+# rejects the whole message ("Wrong data size: 12 instead of 24"), which reads
+# downstream as "this signal was never recorded" rather than "decode failed".
+_FD_DLC_TO_LEN = (0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64)
+
+
 def parse_mf4(path: str) -> list[Frame]:
     """Extract raw CAN frames from a Vector bus-logging MF4 (via asammdf).
 
     Mirrors asammdf's own CAN_DataFrame extraction: bus-event channel groups
     expose a composite ``CAN_DataFrame`` whose sub-channels hold ID / DLC /
     DataBytes / BusChannel, aligned on the master timestamps.
+
+    Payload length comes from ``CAN_DataFrame.DataLength`` when the file has it
+    (Vector writes it for FD logs); otherwise the DLC code is expanded through
+    :data:`_FD_DLC_TO_LEN`. Both are capped by the actual DataBytes row width,
+    which MF4 pads to a fixed 64 bytes.
     """
     try:
         import numpy as _np
@@ -413,15 +444,23 @@ def parse_mf4(path: str) -> list[Frame]:
         ids = _np.asarray(data["CAN_DataFrame.ID"]).astype(_np.uint32) & 0x1FFFFFFF
         dlc = _np.asarray(data["CAN_DataFrame.DLC"]).astype(_np.uint8)
         db = data["CAN_DataFrame.DataBytes"]
+        if "CAN_DataFrame.DataLength" in names:
+            dlen = _np.asarray(data["CAN_DataFrame.DataLength"]).astype(_np.uint16)
+        else:
+            dlen = None
         if "CAN_DataFrame.BusChannel" in names:
             bus = _np.asarray(data["CAN_DataFrame.BusChannel"]).astype(_np.uint8)
         else:
             bus = _np.zeros(len(ts), dtype=_np.uint8)
         for i in range(len(ts)):
             raw = bytes(db[i])
+            if dlen is not None:
+                n = int(dlen[i])
+            else:
+                n = _FD_DLC_TO_LEN[int(dlc[i]) & 0x0F]
             frames.append(Frame(
                 t=float(ts[i]), frame_id=int(ids[i]),
-                data=raw[: int(dlc[i])], channel=int(bus[i]),
+                data=raw[: min(n, len(raw))], channel=int(bus[i]),
                 is_extended=bool(int(ids[i]) > 0x7FF),
             ))
     if not frames:

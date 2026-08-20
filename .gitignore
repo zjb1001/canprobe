@@ -5,3 +5,10 @@ __pycache__/
 .runtime/
 *.egg-info/
 .consult/
+
+# samples: ignore all DBC except cruise.dbc
+samples/*.dbc
+!samples/cruise.dbc
+
+samples/*.blf
+samples/*.mf4

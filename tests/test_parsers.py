@@ -105,6 +105,62 @@ def test_parse_mf4_no_can_channels(tmp_path):
         parse_mf4(path)
 
 
+def test_fd_dlc_code_expands_to_payload_length():
+    """DLC 是 4 bit 编码不是字节数：9..15 对应 12/16/20/24/32/48/64。
+
+    MF4 的 CAN_DataFrame.DLC 存的是原始编码，早先直接拿它当长度切片，
+    24 字节的 FD 报文被截成 12 字节，cantools 整条拒绝，表现为
+    "这个信号这份日志没录到"。
+    """
+    from canprobe.log_parser import _FD_DLC_TO_LEN
+
+    assert _FD_DLC_TO_LEN[:9] == (0, 1, 2, 3, 4, 5, 6, 7, 8)
+    assert (_FD_DLC_TO_LEN[9], _FD_DLC_TO_LEN[10], _FD_DLC_TO_LEN[12]) == (12, 16, 24)
+    assert (_FD_DLC_TO_LEN[13], _FD_DLC_TO_LEN[15]) == (32, 64)
+
+
+def test_parse_mf4_keeps_full_fd_payload():
+    """真实 FD 日志：>8 字节的报文必须整条取出，不能按 DLC 编码截断。"""
+    fixture = Path("samples/20260731_EP35_VN1CG000196_VN2CG000207_AVH_HDC.mf4")
+    if not fixture.exists():
+        pytest.skip("缺少 EP35 MF4 样例")
+    pytest.importorskip("asammdf")
+    from canprobe.log_parser import parse_mf4
+
+    frames = parse_mf4(str(fixture))
+    by_id: dict[int, int] = {}
+    for f in frames:
+        by_id.setdefault(f.frame_id, len(f.data))
+    # 0x270 WCBS_Info 在 DBC 里是 24 字节（DLC 编码 12），0x117 是 16（编码 10）
+    assert by_id[0x270] == 24, "FD 负载被按 DLC 编码截断了"
+    assert by_id[0x117] == 16
+    assert by_id[0x132] == 8
+
+
+def test_signals_with_data_requires_decodability():
+    """报文出现过但解不开时，它的信号不能算"有数据"。
+
+    否则界面显示 15/15 有数据、曲线全空、事件 0 条，"没查到"会被读成"没问题"。
+    """
+    fixture = Path("samples/20260731_EP35_VN1CG000196_VN2CG000207_AVH_HDC.mf4")
+    dbc = Path("samples/03_CCAN_EP_v2.1.0_20260417-MOD.dbc")
+    if not (fixture.exists() and dbc.exists()):
+        pytest.skip("缺少 EP35 样例")
+    pytest.importorskip("asammdf")
+    from canprobe.store import Project
+
+    p = Project()
+    p.load_dbc(str(dbc))
+    p.load_log(str(fixture))
+    # 修好截断后这些 FD 报文的信号都解得出来了
+    for sig in ("WCBS_BrkPedalTravel", "WCBS_MainCylinderPress", "WCBS_LongitudeACC"):
+        t, _ = p.store.series(sig)
+        assert len(t) > 0, sig
+        assert sig in p.store.signals_with_data()
+    # DBC 不认识的 ID 归 unknown，不混进 decode_failures
+    assert all(f["name"] is not None for f in p.store.decode_failures())
+
+
 def test_parse_mf4_real_fixture():
     # 需要一个真实的 Vector 总线日志 MF4（samples/can_sample.mf4）才能实测
     from canprobe.log_parser import parse_mf4

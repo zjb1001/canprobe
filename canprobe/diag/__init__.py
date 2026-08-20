@@ -5,7 +5,10 @@
 错误帧 / 错误状态机（Tier 2，依赖格式能力，后续）；物理层推断（Tier 3，后续）。
 """
 from .engine import run_diagnostics
-from .export import to_markdown
+from .export import message_to_markdown, to_markdown
+from .message import diagnose_message, rank_messages, resolve_message
 from .model import Capabilities, DiagConfig, Finding, NodeSpec
 
-__all__ = ["run_diagnostics", "to_markdown", "Capabilities", "DiagConfig", "Finding", "NodeSpec"]
+__all__ = ["run_diagnostics", "to_markdown", "message_to_markdown", "diagnose_message",
+           "rank_messages", "resolve_message",
+           "Capabilities", "DiagConfig", "Finding", "NodeSpec"]

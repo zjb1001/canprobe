@@ -50,7 +50,14 @@ def _is_active(state: Any, active_set: Optional[set]) -> bool:
     return _truthy(state)
 
 
+_PLAIN_TYPES = (str, bool, int, float, type(None))
+
+
 def _jsonable(v: Any) -> Any:
+    # update() 的返回值几乎总是状态名（str）或 None —— 对这些直接放行，
+    # 别为每一拍都跑一次 json.dumps（500 万拍时这一项就是分钟级的开销）
+    if type(v) in _PLAIN_TYPES:
+        return v
     try:
         import json
         json.dumps(v)
@@ -61,32 +68,58 @@ def _jsonable(v: Any) -> Any:
 
 class _ValueAccessor:
     """Read-only signal value accessor for a fixed time."""
-    def __init__(self, store, t: float, reads: set):
+    __slots__ = ("_store", "_t", "_reads", "_memo")
+
+    def __init__(self, store, t: Optional[float], reads: set):
         self._store = store
         self._t = t
         self._reads = reads
+        self._memo: dict = {}
+
+    def _reset(self, t: Optional[float], reads: set) -> None:
+        """换到下一拍：复用同一个对象，省掉每拍的对象构造。"""
+        self._t = t
+        self._reads = reads
+        self._memo.clear()
+
+    def _get(self, name: str):
+        self._reads.add(name)
+        memo = self._memo
+        if name in memo:                    # 同一拍里 s.X 常被读好几次
+            return memo[name]
+        v = self._store.value_at(name, self._t)
+        memo[name] = v
+        return v
 
     def __getitem__(self, name: str):
-        self._reads.add(name)
-        return self._store.value_at(name, self._t)
+        return self._get(name)
 
     def __getattr__(self, name: str):
-        if name.startswith("_"):
+        # __slots__ 里的属性走不到这里，所以只可能是信号名或私有名
+        if name[0] == "_":
             raise AttributeError(name)
-        self._reads.add(name)
-        return self._store.value_at(name, self._t)
+        return self._get(name)
 
 
 class Signals(_ValueAccessor):
     """Current values + edge helpers, plus ``.prev`` for the previous sample."""
+    __slots__ = ("_prev_t", "prev", "_prev_acc")
+
     def __init__(self, store, t: float, prev_t: Optional[float], reads: set):
         super().__init__(store, t, reads)
         self._prev_t = prev_t
-        self.prev = _ValueAccessor(store, prev_t, reads) if prev_t is not None else self
+        self._prev_acc = _ValueAccessor(store, prev_t, reads)
+        self.prev = self._prev_acc if prev_t is not None else self
+
+    def _reset(self, t: float, prev_t: Optional[float], reads: set) -> None:
+        super()._reset(t, reads)
+        self._prev_t = prev_t
+        self._prev_acc._reset(prev_t, reads)
+        self.prev = self._prev_acc if prev_t is not None else self
 
     def _edge(self, name: str) -> tuple:
-        cur = self[name]
-        pv = self._store.value_at(name, self._prev_t) if self._prev_t is not None else None
+        cur = self._get(name)
+        pv = self._prev_acc._get(name) if self._prev_t is not None else None
         return cur, pv
 
     def rising(self, name: str) -> bool:
@@ -102,11 +135,15 @@ class Signals(_ValueAccessor):
         return cur != pv
 
 
-def run_code_function(store, func: dict) -> dict:
+def run_code_function(store, func: dict, fast: bool = False) -> dict:
     """Run a Python-code function over the timeline.
 
     Returns a dict with ``functions``/``events``/``attempts``/``intervals``
     shaped exactly like :func:`analyzer.analyze_functions` output (for one fn).
+
+    ``fast=True``（可选的"快速求值"模式）只在该功能静态引用到的信号真正变化的
+    时刻调 ``update()``。用户代码是黑盒，跳拍对纯电平/边沿逻辑等价，但对"按拍
+    计数"或依赖固定步长的写法会改变结果 —— 所以默认是 ``False``。
     """
     code = func.get("code")
     if not code:
@@ -140,6 +177,11 @@ def run_code_function(store, func: dict) -> dict:
         active_set = {active_val}
 
     times = store.times
+    if fast:
+        from .analyzer import change_times, function_signals
+        ticks = change_times(store, function_signals(func))
+        if len(ticks):
+            times = ticks
     state = ns.get("INITIAL", None)
     events: list[dict] = []
     attempts: list[dict] = []
@@ -151,10 +193,15 @@ def run_code_function(store, func: dict) -> dict:
         int_start = float(times[0])
 
     prev_t: Optional[float] = None
-    for t in times:
-        ft = float(t)
-        reads: set = set()
-        s = Signals(store, ft, prev_t, reads)
+    all_reads: set = set()          # 全程访问过的信号，供前端「功能→信号」使用
+    # 每拍的信号访问器复用同一个对象：几百万拍时，光是构造 Signals + 两个
+    # 访问器就要占掉可观的时间，而它们的状态只有 (t, prev_t, reads) 三项
+    reads: set = set()
+    s = Signals(store, 0.0, None, reads)
+    for t in times.tolist():
+        ft = t
+        reads.clear()
+        s._reset(ft, prev_t, reads)
         dt = (ft - prev_t) if prev_t is not None else 0.0
         captured["reason"] = None
         captured["attempt"] = None
@@ -197,6 +244,7 @@ def run_code_function(store, func: dict) -> dict:
                 "satisfied": [], "blocking": [],
             })
 
+        all_reads |= reads
         prev_t = ft
 
     if prev_active and int_start is not None and len(times):
@@ -206,7 +254,8 @@ def run_code_function(store, func: dict) -> dict:
         "functions": [{
             "id": fid, "name": name, "description": func.get("description", ""),
             "engine": "python", "enter": None, "exit": None, "trigger": None,
-            "signals": sorted(set()),
+            # 运行期实际读到的信号（分支没走到的抓不着，静态提取见 analyzer.function_signals）
+            "signals": sorted(all_reads | set(func.get("signals") or [])),
         }],
         "events": events,
         "attempts": attempts,

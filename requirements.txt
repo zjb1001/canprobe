@@ -7,5 +7,10 @@ PyYAML>=6.0
 numpy>=1.21
 
 # 可选（重型日志格式，按需安装）
-# python-can>=4.3   # 解析 .blf
+# .blf 由内置的向量化读取器解析（canprobe/blf_fast.py），不需要 python-can；
+# 装了的话会在快速通道解析不了时作为回退，并让 tests/test_blf_fast.py 的对拍生效
+# python-can>=4.3   # .blf 回退实现 + 等价性测试的参照
 # asammdf>=7.3      # 解析 .mf4
+
+# 可选加速：装上 /api/series 这类大响应的 JSON 序列化会明显变快，没装不影响功能
+# orjson>=3.9

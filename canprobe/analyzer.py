@@ -29,6 +29,7 @@ A *function* spec::
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Callable, Optional
 
 OPS = {">", "<", ">=", "<=", "==", "!="}
@@ -58,6 +59,93 @@ def referenced_signals(cond: dict) -> set[str]:
     if "not" in cond:
         names |= referenced_signals(cond["not"])
     return names
+
+
+# Python `code` 片段里的信号引用：s.rising('X') / s['X'] / s.prev['X'] / s.X / s.prev.X
+# 顺序有意义——边沿助手必须排在裸属性之前，否则 `s.rising` 会被当成信号名。
+# `_B` 是左边界：没有它，`tracks.append(...)` 里的 `s.append` 也会匹配上，凭空多出
+# 一个叫 append 的"信号"，然后在功能按钮上报一个查无此物的 ⚠。
+_B = r"(?<![A-Za-z0-9_.])"
+_CODE_SIG_RE = re.compile(
+    rf"{_B}s\s*\.\s*(?:rising|falling|changed)\s*\(\s*['\"](?P<edge>[^'\"]+)['\"]"
+    rf"|{_B}s(?:\s*\.\s*prev)?\s*\[\s*['\"](?P<idx>[^'\"]+)['\"]\s*\]"
+    rf"|{_B}s\s*\.\s*(?:prev\s*\.\s*)?(?P<attr>[A-Za-z_]\w*)"
+)
+_CODE_SKIP = {"prev", "rising", "falling", "changed"}
+
+
+def function_signals(raw: dict) -> list[str]:
+    """静态提取一个 function 声明用到的信号名。
+
+    不需要加载日志，也不执行 ``code``。三个来源取并集：
+
+    * 显式 ``signals: [...]`` 列表（想额外挂几个上下文信号时用）
+    * 声明式 ``enter`` / ``exit`` / ``trigger`` 条件树
+    * Python ``code`` 里的 ``s.X`` / ``s['X']`` / ``s.prev.X`` / ``s.rising('X')``
+
+    code 的提取是静态正则，只能看到字面量信号名；动态拼出来的名字（如
+    ``s[f"Whl{i}"]``）抓不到，这类需要在 ``signals:`` 里显式补。
+
+    返回顺序：显式 ``signals:`` **保持书写顺序**在前，其余按字母序追加。
+    功能按钮是按这个顺序往 Graphics 里加曲线的，而"请求→反馈→上下文"这种
+    排法比字母序好读得多——作者写下的顺序是有意义的信息，不该被 sort 掉。
+    """
+    if not isinstance(raw, dict):
+        return []
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def add(name: str) -> None:
+        if name and name not in seen:
+            seen.add(name)
+            ordered.append(name)
+
+    explicit = raw.get("signals")
+    if isinstance(explicit, (list, tuple)):
+        for x in explicit:
+            if x:
+                add(str(x))
+
+    found: set[str] = set()
+    for key in ("enter", "exit", "trigger"):
+        cond = raw.get(key)
+        if not cond:
+            continue
+        try:
+            found |= referenced_signals(normalize_condition(cond))
+        except SpecError:
+            continue
+
+    code = raw.get("code")
+    if isinstance(code, str) and code.strip():
+        for m in _CODE_SIG_RE.finditer(code):
+            n = m.group("edge") or m.group("idx") or m.group("attr")
+            if n and n not in _CODE_SKIP:
+                found.add(n)
+
+    for n in sorted(found):
+        add(n)
+    return ordered
+
+
+def spec_functions(spec: dict) -> list[dict]:
+    """列出规格里的功能及其引用信号（轻量，不跑状态机、不需要日志）。"""
+    if not isinstance(spec, dict):
+        raise SpecError("分析规格必须是 dict")
+    funcs = spec.get("functions", spec.get("function", []))
+    out: list[dict] = []
+    for raw in funcs or []:
+        if not isinstance(raw, dict) or "id" not in raw:
+            continue
+        fid = raw["id"]
+        out.append({
+            "id": fid,
+            "name": raw.get("name", fid),
+            "description": raw.get("description", ""),
+            "engine": "python" if raw.get("code") else "declarative",
+            "signals": function_signals(raw),
+        })
+    return out
 
 
 def edge_leaves(cond: dict) -> list[dict]:
@@ -241,6 +329,78 @@ def _derive_trigger(enter: dict) -> Optional[dict]:
 
 
 # --------------------------------------------------------------------------- #
+# 时间轴分段
+#
+# 条件求值的输入只有「被引用信号的当前值 + 上一拍值」。信号是零阶保持的，所以
+# 在两个采样点之间取值恒定 —— 一条 10 ms 周期的报文，在 500 万帧的日志里只有
+# 几万个真正的变化点，其余几百万拍的输入和上一拍**一模一样**。
+#
+# 逐拍 evaluate() 因此是纯粹的重复劳动：把时间轴切成「取值恒定」的分段后，
+# 每段只求值一次，段内其余拍用缓存结果重放状态机（见 analyze_functions）。
+# 重放保证事件与 attempts 的条数、时刻与逐拍求值完全一致。
+# --------------------------------------------------------------------------- #
+def change_times(store, sigs) -> "Any":
+    """被引用信号真正有新采样的时刻（升序去重）。"""
+    import numpy as np
+
+    marks = []
+    for s in sigs:
+        ax = store.series(s)[0]
+        if len(ax):
+            marks.append(np.asarray(ax))
+    if not marks:
+        return np.array([], dtype=float)
+    return np.unique(np.concatenate(marks))
+
+
+def constant_runs(store, sigs):
+    """把时间轴切成取值恒定的分段。
+
+    产出 ``(t, cur, rest)``：``t`` 是分段起点，``cur`` 是该段内恒定的
+    ``{信号: 值}``，``rest`` 是段内其余时间戳。等价于逐拍
+    ``{s: store.value_at(s, t) for s in sigs}``，但不做百万次 bisect ——
+    每个采样点只在它所属分段的起点更新一次。
+    """
+    import numpy as np
+
+    times = store.times
+    n = len(times)
+    if not n:
+        return
+    sigs = sorted(sigs)
+    axes = {s: store.series(s) for s in sigs}
+
+    marks = [np.asarray(ax) for ax, _ in axes.values() if len(ax)]
+    if marks:
+        cp = np.unique(np.concatenate(marks))
+        bidx = np.searchsorted(times, cp, side="left")
+        bounds = np.unique(np.concatenate(([0], bidx[bidx < n])))
+    else:
+        bounds = np.array([0])
+
+    bt = times[bounds]
+    updates: list[list] = [[] for _ in range(len(bounds))]
+    for s in sigs:
+        ax, vals = axes[s]
+        if not len(ax):
+            continue
+        # 每个采样点落在它自己那个分段的起点上；同一时刻的重复采样后者覆盖前者，
+        # 与 value_at 的 bisect_right-1 语义一致
+        bi = np.searchsorted(bt, np.asarray(ax), side="right") - 1
+        for k, b in enumerate(bi.tolist()):
+            if b >= 0:
+                updates[b].append((s, vals[k]))
+
+    cur = {s: None for s in sigs}
+    blist = bounds.tolist()
+    for i, b in enumerate(blist):
+        for s, v in updates[i]:
+            cur[s] = v
+        end = blist[i + 1] if i + 1 < len(blist) else n
+        yield float(times[b]), dict(cur), times[b + 1:end]
+
+
+# --------------------------------------------------------------------------- #
 # Function analysis
 # --------------------------------------------------------------------------- #
 def _summarize(node: dict) -> str:
@@ -255,10 +415,13 @@ def _summarize(node: dict) -> str:
     return str(node.get("text", ""))
 
 
-def analyze_functions(store, spec: dict) -> dict:
+def analyze_functions(store, spec: dict, fast: bool = False) -> dict:
     """Run function analysis over a :class:`SeriesStore`.
 
     ``spec`` looks like ``{"functions": [ {id,name,enter,exit?,trigger?,initial?} ]}``.
+
+    ``fast=True`` 时只在被引用信号真正变化的时刻求值（可选的"快速求值"模式）。
+    默认 ``False`` 逐拍求值，输出与逐拍遍历时间轴完全一致。
     """
     if not isinstance(spec, dict):
         raise SpecError("分析规格必须是 dict")
@@ -277,7 +440,7 @@ def analyze_functions(store, spec: dict) -> dict:
         # 带 code 字段 → 直接执行用户 Python 参考功能代码
         if raw.get("code"):
             from .executor import run_code_function  # 惰性导入避免循环依赖
-            r = run_code_function(store, raw)
+            r = run_code_function(store, raw, fast=fast)
             result["functions"].extend(r["functions"])
             result["events"].extend(r["events"])
             result["attempts"].extend(r["attempts"])
@@ -297,47 +460,72 @@ def analyze_functions(store, spec: dict) -> dict:
         if active:
             interval_start = float(times[0]) if len(times) else None
 
-        for t in times:
-            cur = {s: store.value_at(s, float(t)) for s in sigs}
-            get_cur = lambda s, _cur=cur: _cur.get(s)
-            get_prev = lambda s, _prev=prev: _prev.get(s)
+        events, attempts = result["events"], result["attempts"]
 
-            enter_ok, enter_ev = evaluate(enter, get_cur, get_prev)
-            exit_ok = False
-            exit_ev = None
-            if exit_cond is not None:
-                exit_ok, exit_ev = evaluate(exit_cond, get_cur, get_prev)
-
+        def step(t: float, enter_ok, enter_ev, exit_ok, exit_ev, trig) -> None:
+            """状态机的一拍。``trig`` 是延迟求值的 (ok, evidence) 取值函数。"""
+            nonlocal active, interval_start
             if active and exit_ok:
                 active = False
                 if interval_start is not None:
-                    intervals.append([interval_start, float(t)])
-                result["events"].append({
-                    "function": fid, "type": "exit", "t": float(t),
+                    intervals.append([interval_start, t])
+                events.append({
+                    "function": fid, "type": "exit", "t": t,
                     "summary": _summarize(exit_ev), "evidence": exit_ev,
                 })
             elif not active and enter_ok:
                 active = True
-                interval_start = float(t)
-                result["events"].append({
-                    "function": fid, "type": "enter", "t": float(t),
+                interval_start = t
+                events.append({
+                    "function": fid, "type": "enter", "t": t,
                     "summary": _summarize(enter_ev), "evidence": enter_ev,
                 })
 
             # blocked attempts: trigger fired but entry not granted
             if not active and not enter_ok and trigger is not None:
-                trig_ok, trig_ev = evaluate(trigger, get_cur, get_prev)
+                trig_ok, trig_ev = trig()
                 if trig_ok:
                     leaves = flatten_leaves(enter_ev)
-                    result["attempts"].append({
-                        "function": fid, "t": float(t),
+                    attempts.append({
+                        "function": fid, "t": t,
                         "trigger": _summarize(trig_ev),
                         "trigger_evidence": trig_ev,
                         "satisfied": [l for l in leaves if l.get("ok")],
                         "blocking": [l for l in leaves if not l.get("ok")],
                     })
 
+        for t0, cur, rest in constant_runs(store, sigs):
+            get_cur = lambda s, _cur=cur: _cur.get(s)
+            get_prev = lambda s, _prev=prev: _prev.get(s)
+
+            enter_ok, enter_ev = evaluate(enter, get_cur, get_prev)
+            exit_ok, exit_ev = (evaluate(exit_cond, get_cur, get_prev)
+                                if exit_cond is not None else (False, None))
+            step(t0, enter_ok, enter_ev, exit_ok, exit_ev,
+                 lambda: evaluate(trigger, get_cur, get_prev))
             prev = cur
+
+            if fast or not len(rest):
+                continue
+
+            # 段内其余拍：cur 与 prev 相同，输入完全一致，只需求值一次后重放。
+            # 一旦出现「状态没变且没产出任何行」的不动点，后面每一拍都会一样，
+            # 直接跳到段尾 —— 这是把百万次 evaluate() 压成几万次的地方。
+            e_ok, e_ev = evaluate(enter, get_cur, get_cur)
+            x_ok, x_ev = (evaluate(exit_cond, get_cur, get_cur)
+                          if exit_cond is not None else (False, None))
+            cached_trig: list = []
+
+            def same_trig(_c=get_cur):
+                if not cached_trig:
+                    cached_trig.append(evaluate(trigger, _c, _c))
+                return cached_trig[0]
+
+            for t in rest.tolist():
+                mark = (active, len(events), len(attempts))
+                step(float(t), e_ok, e_ev, x_ok, x_ev, same_trig)
+                if mark == (active, len(events), len(attempts)):
+                    break
 
         if active and interval_start is not None and len(times):
             intervals.append([interval_start, float(times[-1])])
@@ -375,21 +563,33 @@ def evaluate_timeline(store, cond: dict) -> dict:
     state: Optional[bool] = None
     start: Optional[float] = None
 
-    for t in times:
-        cur = {s: store.value_at(s, float(t)) for s in sigs}
+    # 与 analyze_functions 同理：取值恒定的分段内只求值一次。这里的状态机更简单
+    # ——段内第二拍起输入完全相同，最多再翻转一次，之后必然稳定。
+    for t0, cur, rest in constant_runs(store, sigs):
         get_cur = lambda s, _cur=cur: _cur.get(s)
         get_prev = lambda s, _prev=prev: _prev.get(s)
         ok, ev = evaluate(cond, get_cur, get_prev)
         if state is None:
             state = ok
-            start = float(t)
+            start = t0
         elif ok != state:
-            transitions.append({"t": float(t), "to": ok, "summary": _summarize(ev), "evidence": ev})
+            transitions.append({"t": t0, "to": ok, "summary": _summarize(ev), "evidence": ev})
             if state:
-                intervals.append([start, float(t)])
+                intervals.append([start, t0])
             state = ok
-            start = float(t)
+            start = t0
         prev = cur
+
+        if not len(rest):
+            continue
+        ok2, ev2 = evaluate(cond, get_cur, get_cur)
+        if ok2 != state:
+            t = float(rest[0])
+            transitions.append({"t": t, "to": ok2, "summary": _summarize(ev2), "evidence": ev2})
+            if state:
+                intervals.append([start, t])
+            state = ok2
+            start = t
 
     if state and start is not None and len(times):
         intervals.append([start, float(times[-1])])

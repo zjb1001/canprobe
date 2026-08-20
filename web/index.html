@@ -20,9 +20,21 @@
     </div>
   </header>
 
+  <div id="mismatch" class="mismatch hidden"></div>
+
   <div class="layout">
     <aside class="sidebar">
-      <div class="panel">
+      <div class="panel" id="funcPanel">
+        <button id="funcToggle" class="panel-title paneltoggle" type="button"
+                aria-expanded="true" aria-controls="functionButtons" title="展开 / 折叠功能列表">
+          <span class="caret" aria-hidden="true">▾</span>
+          <span>功能</span>
+          <span id="funcCount" class="muted"></span>
+          <span id="funcMsg" class="fmsg"></span>
+        </button>
+        <div id="functionButtons" class="funcbtns"></div>
+      </div>
+      <div class="panel grow">
         <div class="panel-title">信号 <span id="signalCount" class="muted"></span></div>
         <div class="addsig">
           <input id="signalAdd" class="search" list="signalList" placeholder="输入信号名添加…" autocomplete="off" />
@@ -31,10 +43,6 @@
         </div>
         <input id="signalSearch" class="search" placeholder="搜索信号 / 报文…" />
         <div id="signalTree" class="tree"></div>
-      </div>
-      <div class="panel grow">
-        <div class="panel-title">功能</div>
-        <div id="functionList" class="funclist"></div>
       </div>
     </aside>
 
@@ -54,27 +62,57 @@
           <option value="25">25×</option>
         </select>
         <span id="rangeLabel" class="muted"></span>
+
+        <div class="zoomgrp" title="X 轴（时间）缩放，以光标为中心">
+          <span class="zlabel">X</span>
+          <button id="btnXOut" class="tb zb" title="时间轴放大范围（看得更宽）">−</button>
+          <button id="btnXIn" class="tb zb" title="时间轴缩小范围（看得更细）">+</button>
+        </div>
+        <div class="zoomgrp" title="Y 轴整体缩放：所有信号条带一起变高 / 变矮">
+          <span class="zlabel">Y</span>
+          <button id="btnYOut" class="tb zb" title="纵向压缩">−</button>
+          <button id="btnYIn" class="tb zb" title="纵向拉伸">+</button>
+        </div>
+        <button id="btnZoomReset" class="tb" title="复位 X / Y 缩放">复位</button>
+      </div>
+
+      <div id="evRibbon" class="ev-ribbon" title="关键事件时间轴（与下方图表 X 轴对齐，点击刻度跳转）">
+        <div id="evRibbonTrack" class="ev-ribbon-track"></div>
       </div>
 
       <div class="charts-scroll">
-        <div id="chart" class="chart"></div>
-        <div id="stateChart" class="chart statechart"></div>
+        <div id="chartWrap" class="chart-wrap">
+          <div id="chart" class="chart"></div>
+          <!-- 光标线走 DOM 叠加层而不是每条曲线一根 markLine：回放时光标每帧都要
+               动，用 setOption 挪 markLine 等于每帧重算整张图的 option -->
+          <div id="cursorLine" class="cursor-line hidden"></div>
+        </div>
       </div>
 
-      <div class="trace">
-        <div class="panel-title">报文跟踪 <span id="traceInfo" class="muted"></span></div>
-        <div class="table-wrap" id="traceWrap">
-          <table id="traceTable">
-            <thead>
-              <tr><th>时间</th><th>ID</th><th>报文</th><th>信号值</th></tr>
-            </thead>
-            <tbody></tbody>
-          </table>
+      <div class="events">
+        <div class="ev-head">
+          <div class="panel-title">关键事件 <span id="evCount" class="muted"></span></div>
+          <div class="ev-tools">
+            <div class="ev-types" id="evTypes">
+              <button class="evtype on" data-type="enter" title="功能进入">▲ 进入</button>
+              <button class="evtype on" data-type="exit" title="功能退出">▼ 退出</button>
+              <button class="evtype on" data-type="change" title="状态迁移（Python 功能的非进出跳变）">◆ 变化</button>
+            </div>
+            <input id="evSearch" class="ev-search" placeholder="搜索功能 / 原因…" autocomplete="off" />
+            <button id="evFollow" class="evbtn on" title="回放 / 拖动光标时自动高亮当前所处的事件">跟随光标</button>
+            <button id="evFast" class="evbtn" title="快速求值：只在功能引用的信号真正变化的时刻求值，几百万帧的日志能快十几倍。&#10;对纯电平 / 边沿逻辑结果一致；规格里按 tick 计数或依赖固定步长的 Python code 可能给出不同结果。&#10;默认关闭 = 逐时间戳精确求值。">快速求值</button>
+            <button id="evPrev" class="evbtn" title="上一个事件（快捷键 , ）">◀</button>
+            <button id="evNext" class="evbtn" title="下一个事件（快捷键 . ）">▶</button>
+          </div>
         </div>
+        <div id="evFuncs" class="ev-funcs"></div>
+        <div id="evList" class="ev-list"></div>
       </div>
     </main>
 
-    <aside class="valuepanel">
+    <div id="vresizer" class="vresizer" title="拖拽调整宽度（双击复位）"></div>
+
+    <aside id="valuePanel" class="valuepanel">
       <div class="vp-head">
         <div class="panel-title">信号值 <span id="valueTime" class="muted"></span></div>
         <div class="vtoggle">
@@ -112,6 +150,11 @@
           <a id="diagExport" class="btn" href="/api/diag/export?fmt=md" download="diagnosis-report.md">导出 Markdown</a>
           <button id="diagClose" class="btn">×</button>
         </div>
+      </div>
+      <div class="diag-message-search">
+        <input id="diagMsgInput" list="diagMessageList" placeholder="报文 ID 或名称，如 0x270" autocomplete="off" />
+        <datalist id="diagMessageList"></datalist>
+        <button id="diagMsgLocate" class="btn btn-accent">定位报文</button>
       </div>
       <div id="diagBody" class="diag-body"></div>
     </div>

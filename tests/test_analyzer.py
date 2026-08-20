@@ -65,6 +65,25 @@ def test_referenced_signals():
     assert referenced_signals(cond) == {"Btn", "VehSpd"}
 
 
+def test_function_signals_from_code_ignores_method_calls():
+    """静态提取只能认 `s.` 开头的引用，不能把 `tracks.append` 里的 s. 也算上。
+
+    回归用：缺左边界时 `tracks.append(...)` 会凭空提取出一个叫 append 的信号，
+    进而在功能按钮上报一个"当前 DBC 中不存在"的假 ⚠。
+    """
+    from canprobe.analyzer import function_signals
+    code = (
+        "def update(t, s, dt):\n"
+        "    tracks.append([1])\n"
+        "    items.sort()\n"
+        "    obj.s.bogus\n"
+        "    if s.rising('Btn') and s['MotorTemp'] > 3 and s.prev.BrakePedal:\n"
+        "        return s.VehSpd\n"
+    )
+    assert function_signals({"id": "x", "code": code}) == [
+        "BrakePedal", "Btn", "MotorTemp", "VehSpd"]
+
+
 def test_invalid_condition():
     from canprobe.analyzer import normalize_condition
 
@@ -77,7 +96,7 @@ def test_invalid_condition():
 
 # --- function analysis over the sample scenario --------------------------- #
 def test_analyze_cruise_events():
-    spec = yaml.safe_load((ROOT / "samples" / "functions.yaml").read_text())
+    spec = yaml.safe_load((ROOT / "samples" / "functions.yaml").read_text(encoding="utf-8"))
     res = analyze_functions(_store(), spec)
 
     events = {(e["function"], e["type"]): e for e in res["events"]}
@@ -97,7 +116,7 @@ def test_analyze_cruise_events():
 
 
 def test_analyze_blocked_attempt():
-    spec = yaml.safe_load((ROOT / "samples" / "functions.yaml").read_text())
+    spec = yaml.safe_load((ROOT / "samples" / "functions.yaml").read_text(encoding="utf-8"))
     res = analyze_functions(_store(), spec)
 
     attempts = [a for a in res["attempts"] if a["function"] == "cruise"]
@@ -112,7 +131,7 @@ def test_analyze_blocked_attempt():
 
 
 def test_analyze_intervals():
-    spec = yaml.safe_load((ROOT / "samples" / "functions.yaml").read_text())
+    spec = yaml.safe_load((ROOT / "samples" / "functions.yaml").read_text(encoding="utf-8"))
     res = analyze_functions(_store(), spec)
     assert res["intervals"]["cruise"] == [[8.0, 15.0]]
 
