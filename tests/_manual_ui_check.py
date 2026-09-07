@@ -122,9 +122,13 @@ with sync_playwright() as pw:
     n_ev = page.locator("#evList .evrow").count()
     check("事件面板出结果", n_ev >= 0, f"{n_ev} 行 / {page.inner_text('#evCount')}")
     if n_ev:
-        page.locator("#evList .evrow").nth(min(2, n_ev - 1)).click()   # 委托的 click
+        event_index = min(2, n_ev - 1)
+        event_time = page.evaluate(f"state.events[{event_index}].t")
+        page.locator("#evList .evrow").nth(event_index).click()   # 委托的 click
         page.wait_for_timeout(800)
         check("点事件后有行被高亮", page.locator("#evList .evrow.active").count() == 1)
+        check("点事件后光标跳到事件时刻", abs(page.evaluate("state.t") - event_time) < 1e-6,
+              f"{page.evaluate('state.t'):.3f} vs {event_time:.3f}")
         check("ribbon 有刻度", page.locator("#evRibbonTrack .ev-tick").count() > 0,
               f"{page.locator('#evRibbonTrack .ev-tick').count()} 个")
 

@@ -32,7 +32,7 @@ class CDP:
             raise RuntimeError(r["exceptionDetails"])
         return r["result"].get("value")
 
-    async def click_nth(self, sel, n):
+    async def click_nth(self, sel, n, ctrl=False):
         box = await self.js(f"const e=document.querySelectorAll('{sel}')[{n}];"
                             "if(!e)return null;const r=e.getBoundingClientRect();"
                             "return {x:r.x+r.width/2,y:r.y+r.height/2,d:e.disabled};")
@@ -40,7 +40,8 @@ class CDP:
             return False
         for t in ("mousePressed", "mouseReleased"):
             await self.call("Input.dispatchMouseEvent", type=t, x=box["x"], y=box["y"],
-                            button="left", buttons=1, clickCount=1, pointerType="mouse")
+                            button="left", buttons=1, clickCount=1, pointerType="mouse",
+                            modifiers=2 if ctrl else 0)
         await asyncio.sleep(0.6)
         return True
 
@@ -110,32 +111,59 @@ async def main():
         if checked != len(sel1):
             fails.append(f"signal tree shows {checked} checked, expected {len(sel1)}")
 
-        # --- click again: append semantics, nothing added, no duplication ---
+        # --- click again: same single-function view, nothing duplicated ---
         await c.click_nth(".funcbtn", 0)
         sel2 = await c.js("return [...state.selected]")
         msg2 = await c.js("return document.getElementById('funcMsg').textContent")
         print(f"after re-click #1 = {sorted(sel2)}  msg={msg2!r}")
         if set(sel2) != expect1:
             fails.append("re-click changed the selection")
-        if "已在图中" not in (msg2 or ""):
-            fails.append(f"expected '已在图中' feedback on re-click, got {msg2!r}")
+        active1 = await c.js("return [...document.querySelectorAll('.funcbtn.on')]"
+                             ".map(b=>b.querySelector('.fb-name').textContent)")
+        event_filter1 = await c.js("return [...state.evFuncs]")
+        if len(active1) != 1 or event_filter1 != ["cruise"]:
+            fails.append(f"function/event focus not synced: {active1}, {event_filter1}")
 
-        # --- click second function: must APPEND, not replace ---
+        # --- normal click switches to the second function only ---
         await c.click_nth(".funcbtn", 1)
         sel3 = await c.js("return [...state.selected]")
         msg3 = await c.js("return document.getElementById('funcMsg').textContent")
         print(f"after click #2 = {sorted(sel3)}  msg={msg3!r}")
-        if not expect1.issubset(set(sel3)):
-            fails.append(f"append semantics broken — first function's signals lost: {sorted(sel3)}")
-        if "MotorTemp" not in sel3:
-            fails.append("overtemp signal MotorTemp not added")
-        if len(sel3) != 5:
-            fails.append(f"expected 5 signals after appending, got {len(sel3)}")
+        if set(sel3) != {"MotorTemp"}:
+            fails.append(f"normal click should replace the view: {sorted(sel3)}")
+        active2 = await c.js("return [...document.querySelectorAll('.funcbtn.on')]"
+                             ".map(b=>b.querySelector('.fb-name').textContent)")
+        event_filter2 = await c.js("return [...state.evFuncs]")
+        if len(active2) != 1 or event_filter2 != ["overtemp"]:
+            fails.append(f"second function/event focus not synced: {active2}, {event_filter2}")
 
         grids = await c.js("return state.chart.getOption().grid.length")
-        print(f"chart strips after append = {grids}")
+        print(f"chart strips after switch = {grids}")
+        if grids != 1:
+            fails.append(f"chart strips {grids} != 1")
+
+        # --- Ctrl+click appends the first function for cross-function comparison ---
+        await c.click_nth(".funcbtn", 0, ctrl=True)
+        sel4 = await c.js("return [...state.selected]")
+        print(f"after Ctrl+click #1 = {sorted(sel4)}")
+        if set(sel4) != expect1 | {"MotorTemp"}:
+            fails.append(f"Ctrl+click should append without losing signals: {sorted(sel4)}")
+        active4 = await c.js("return document.querySelectorAll('.funcbtn.on').length")
+        if active4:
+            fails.append(f"mixed view should have no active function button, got {active4}")
+        event_filter4 = await c.js("return [...state.evFuncs]")
+        if event_filter4 != ["overtemp"]:
+            fails.append(f"Ctrl+click should preserve the event filter: {event_filter4}")
+
+        grids = await c.js("return state.chart.getOption().grid.length")
         if grids != 5:
-            fails.append(f"chart strips {grids} != 5")
+            fails.append(f"chart strips after Ctrl+click {grids} != 5")
+
+        # A normal click restores a single-function view after comparison.
+        await c.click_nth(".funcbtn", 0)
+        sel5 = await c.js("return [...state.selected]")
+        if set(sel5) != expect1:
+            fails.append(f"normal click did not restore the single-function view: {sorted(sel5)}")
 
         # --- missing-signal path: spec referencing signals absent from the DBC ---
         bad = ("functions:\n"
