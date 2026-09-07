@@ -45,9 +45,11 @@
 #   请求发出后既无 DspMsg 也无法用可观测信号解释仍未执行的，归类
 #   NO_VISIBLE_CAUSE（不臆测是执行层还是内部拒绝）。
 #
-# 三个 function：
+# 五个 function：
 #   epb_apply    夹紧全链路（请求 → 判决 → Locking → Locked，含"为什么没夹紧"）
 #   epb_release  释放全链路，含 DAR 自动释放候选路径
+#   epb_transition_integrity  独立检查无前置可见请求的状态迁移与未完成反向迁移
+#   brake_pressure_response   独立检查踏板输入与主缸压力响应一致性
 #   epb_health   故障位 / 开关健康度 / 双反馈(EPB_Sts vs ADCU_VAP_EPBState)一致性
 #                （独立处境，排查也可以先看这条）
 #
@@ -251,8 +253,9 @@ functions:
       （挡位稳定切入 D/R 且有制动介入证据，只是"候选条件"，不代表 ECU 已发出
       内部 DAR 请求）/ M2S 请求镜像（无方向，需当前终态为 Locked 才归为 Release
       辅证）。EPB_Sts: Locked→Releasing→Released。请求后未释放时，优先用
-      EPB_SysDspMsgReq（如 DAR_Nok_DoorOpen）；否则用 点火 ON 且(主缸压力/踏板
-      介入) 推断"驾驶员是否在场"（DriverPresent 的近似，非直接证据）。
+            EPB_SysDspMsgReq（如 DAR_Nok_DoorOpen）；否则用 点火 ON 且有效主缸压力
+            推断"驾驶员是否在场"（DriverPresent 的近似，非直接证据）。踏板开度只作
+            上下文，不替代液压介入证据；踏板/压力一致性由独立功能检查。
     signals:
       - CVC_EPB_SwitchSta              # 请求：驾驶员 P 键
       - CVC_ACTGear                     # 请求：DAR 候选（切 D/R）
@@ -266,6 +269,8 @@ functions:
       - WCBS_MainCylinderPressValid
       - WCBS_BrkPedalPct               # 上下文：踏板开度（辅助推断制动介入）
       - WCBS_BrkPedalValid
+            - WCBS_VehicleSpeed
+            - WCBS_VehicleSpeedValid
       - WCBS_EPB_Fault
       - EPB_Swch_Mafnc
     code: |
@@ -281,7 +286,6 @@ functions:
       NO_CAUSE_TMO = 1.50
       COMPLETE_TMO = 5.0
       PRESS_ON     = 3.0   # bar，主缸压力判"驾驶员在踩制动"门限（工程近似，非精确算法）
-      PEDAL_ON     = 5.0   # %，踏板开度辅助门限
 
       sw_cand = None; sw_cand_t = None; sw_stable = None
       gear_cand = None; gear_cand_t = None; gear_stable = None
@@ -298,10 +302,6 @@ functions:
           p = s.WCBS_MainCylinderPress
           if (p is not None and s.WCBS_MainCylinderPressValid in (None, "Valid")
                   and float(p) >= PRESS_ON):
-              return True
-          ped = s.WCBS_BrkPedalPct
-          if (ped is not None and s.WCBS_BrkPedalValid in (None, "Valid")
-                  and float(ped) >= PEDAL_ON):
               return True
           return False
 
@@ -352,7 +352,14 @@ functions:
               gear_stable = gear_cand
           if gear_stable in ("D", "R") and brake_intervening(s):
               gear_stable_dr = True
-          dar_intent = gear_stable_dr and sts in ("Locked", "Locking")
+          speed = s.WCBS_VehicleSpeed
+          vehicle_stopped = (speed is not None
+                              and s.WCBS_VehicleSpeedValid in (None, "Valid")
+                              and float(speed) <= 1.0)
+          # DAR 从已夹紧稳态释放。车辆移动或仍在 Locking 时，不把 D/R+踏板
+          # 解释成 DAR，避免掩盖异常的动态夹紧状态迁移。
+          dar_intent = (gear_stable_dr and sts == "Locked" and vehicle_stopped
+                        and brake_intervening(s))
 
           m2s_req_edge = (s.changed("M2SApplyReleaseRequest")
                            and s.M2SApplyReleaseRequest == "Request")
@@ -433,6 +440,209 @@ functions:
                   return "RELEASE_NO_VISIBLE_CAUSE"
               return None
 
+          return None
+
+  # ===========================================================================
+  # EPB 状态迁移完整性 —— 独立于正常 Apply / Release 事务
+  # ===========================================================================
+  - id: epb_transition_integrity
+    name: "EPB 状态迁移完整性"
+    description: >-
+      独立检查 EPB_Sts 的状态迁移是否有可见前置请求，以及执行是否到达对应终态。
+      Released/Unknown→Locking 前应先看到稳定 P 键 Apply 意图或 M2S Request；
+      Locked→Releasing 前应先看到稳定 P 键 Release 意图或 M2S Request。
+      另检查 Locking 未到 Locked 即转 Releasing、Releasing 未到 Released 即转
+      Locking。M2S 不含方向，仅作为“存在可见请求”的时序证据。CDP、故障位和挡位
+      只作为上下文，不据此臆测内部触发源或根因。
+    signals:
+      - CVC_EPB_SwitchSta
+      - M2SApplyReleaseRequest
+      - EPB_Sts
+      - WCBS_ADCU_VAP_EPBState
+      - EPB_CDPActive
+      - WCBS_CDPFailSts
+      - WCBS_EPB_Fault
+      - EPB_Swch_Mafnc
+      - CVC_ACTGear
+      - WCBS_VehicleSpeed
+      - WCBS_VehicleSpeedValid
+      - WCBS_BrkPedalPct
+      - WCBS_MainCylinderPress
+    code: |
+      ACTIVE_STATES = ["LOCKING_WITHOUT_VISIBLE_REQUEST",
+                        "RELEASING_WITHOUT_VISIBLE_REQUEST",
+                        "APPLY_REVERSED_BEFORE_LOCKED",
+                        "RELEASE_REVERSED_BEFORE_RELEASED"]
+      INITIAL = "OK"
+
+      REQUEST_LOOKBACK = 0.30  # s，可见请求允许早于状态迁移的最大时窗
+      SW_HOLD = 0.20           # s，P 键稳定后才作为请求证据
+
+      sw_candidate = None
+      sw_candidate_t = None
+      sw_stable = None
+      last_switch_request_t = None
+      last_m2s_request_t = None
+      previous_epb_state = None
+      locking_started_t = None
+      releasing_started_t = None
+
+      def recent_request(t):
+          times = [x for x in (last_switch_request_t, last_m2s_request_t)
+                   if x is not None]
+          return bool(times) and (t - max(times)) <= REQUEST_LOOKBACK
+
+      def context(s):
+          return ("P键=%s、M2S=%s、车速=%s km/h、挡位=%s、CDP=%s、"
+                  "EPB故障=%s、开关故障=%s、CDP故障=%s"
+                  % (s.CVC_EPB_SwitchSta, s.M2SApplyReleaseRequest,
+                     s.WCBS_VehicleSpeed, s.CVC_ACTGear, s.EPB_CDPActive,
+                     s.WCBS_EPB_Fault, s.EPB_Swch_Mafnc, s.WCBS_CDPFailSts))
+
+      def update(t, s, dt):
+          global sw_candidate, sw_candidate_t, sw_stable
+          global last_switch_request_t, last_m2s_request_t
+          global previous_epb_state, locking_started_t, releasing_started_t
+
+          sts = s.EPB_Sts
+          if sts is None or sts == "Invalid":
+              return None
+
+          sw = s.CVC_EPB_SwitchSta
+          if sw != sw_candidate:
+              sw_candidate = sw
+              sw_candidate_t = t
+          if (sw_candidate != sw_stable and sw_candidate_t is not None
+                  and (t - sw_candidate_t) >= SW_HOLD):
+              old_stable = sw_stable
+              sw_stable = sw_candidate
+              if sw_stable == "Pressed" and old_stable != "Pressed":
+                  last_switch_request_t = t
+
+          if (s.changed("M2SApplyReleaseRequest")
+                  and s.M2SApplyReleaseRequest == "Request"):
+              last_m2s_request_t = t
+
+          if previous_epb_state is None:
+              previous_epb_state = sts
+              return "OK"
+          if sts == previous_epb_state:
+              return None
+
+          old = previous_epb_state
+          previous_epb_state = sts
+
+          if sts == "Locking":
+              locking_started_t = t
+              if old == "Releasing":
+                  duration = (t - releasing_started_t
+                              if releasing_started_t is not None else 0.0)
+                  reason("EPB Releasing 未到 Released 即反向进入 Locking：持续 %.3fs；%s"
+                         % (duration, context(s)))
+                  return "RELEASE_REVERSED_BEFORE_RELEASED"
+              if old in ("Released", "Unknown") and not recent_request(t):
+                  reason("EPB 在无前置可见请求时从 %s 进入 Locking；%s。"
+                         "该结论只说明总线未观察到前置请求，不等同于确定的非预期夹紧"
+                         % (old, context(s)))
+                  return "LOCKING_WITHOUT_VISIBLE_REQUEST"
+
+          if sts == "Releasing":
+              releasing_started_t = t
+              if old == "Locking":
+                  duration = (t - locking_started_t
+                              if locking_started_t is not None else 0.0)
+                  reason("EPB Locking 未到 Locked 即反向进入 Releasing：持续 %.3fs；%s"
+                         % (duration, context(s)))
+                  return "APPLY_REVERSED_BEFORE_LOCKED"
+              if old == "Locked" and not recent_request(t):
+                  reason("EPB 在无前置可见请求时从 Locked 进入 Releasing；%s。"
+                         "该结论只说明总线未观察到前置请求" % context(s))
+                  return "RELEASING_WITHOUT_VISIBLE_REQUEST"
+
+          if sts in ("Locked", "Released"):
+              reason("EPB 状态迁移到终态 %s，迁移完整性恢复" % sts)
+              return "OK"
+          return None
+
+  # ===========================================================================
+  # 制动踏板 / 主缸压力响应 —— 独立于 EPB 状态机
+  # ===========================================================================
+  - id: brake_pressure_response
+    name: "制动踏板 / 主缸压力响应"
+    description: >-
+      独立检查有效踏板输入与有效主缸压力的响应一致性。深踩踏板后若主缸压力在
+      可标定时间内仍低于工程筛查阈值，则报告 SUSPECTED_LOW_PRESSURE_RESPONSE；
+      信号无效单独报告 INPUT_INVALID。该功能只定位可疑时间窗，不把压力偏低表述为
+      完全无压力，也不直接判定液压硬件根因；阈值需按车型目标压力标定复核。
+    signals:
+      - WCBS_BrkPedalPct
+      - WCBS_BrkPedalTravel
+      - WCBS_BrkPedalValid
+      - WCBS_MainCylinderPress
+      - WCBS_MainCylinderPressValid
+      - CVC_StsBrakePedalSwitch
+      - WCBS_VehicleSpeed
+      - WCBS_VehicleSpeedValid
+      - CVC_ACTGear
+      - EPB_Sts
+      - EPB_CDPActive
+    code: |
+      ACTIVE_STATES = ["SUSPECTED_LOW_PRESSURE_RESPONSE", "INPUT_INVALID"]
+      INITIAL = "OK"
+
+      PEDAL_HIGH = 90.0       # %，深踩踏板筛查阈值
+      PEDAL_CLEAR = 80.0      # %，退出滞回
+      PRESS_MIN = 20.0        # bar，深踩时最低工程筛查阈值，需按车型标定复核
+      RESPONSE_TMO = 0.30     # s，允许液压响应建立的时间
+
+      mismatch_since = None
+      max_pedal = None
+      min_pressure = None
+
+      def update(t, s, dt):
+          global mismatch_since, max_pedal, min_pressure
+
+          pedal = s.WCBS_BrkPedalPct
+          pressure = s.WCBS_MainCylinderPress
+          if pedal is None or pressure is None:
+              mismatch_since = None; max_pedal = None; min_pressure = None
+              return "OK"
+
+          if (s.WCBS_BrkPedalValid not in (None, "Valid")
+                  or s.WCBS_MainCylinderPressValid not in (None, "Valid")):
+              mismatch_since = None; max_pedal = None; min_pressure = None
+              reason("制动输入信号无效：PedalValid=%s、PressureValid=%s；不做压力响应判定"
+                     % (s.WCBS_BrkPedalValid, s.WCBS_MainCylinderPressValid))
+              return "INPUT_INVALID"
+
+          pedal = float(pedal)
+          pressure = float(pressure)
+          if pedal >= PEDAL_HIGH and pressure < PRESS_MIN:
+              if mismatch_since is None:
+                  mismatch_since = t
+                  max_pedal = pedal
+                  min_pressure = pressure
+              else:
+                  max_pedal = max(max_pedal, pedal)
+                  min_pressure = min(min_pressure, pressure)
+              if (t - mismatch_since) >= RESPONSE_TMO:
+                  reason("深踩踏板后压力响应疑似偏低，持续 %.2fs：踏板最高 %.1f%%、"
+                         "主缸压力最低 %.2f bar（筛查阈值 %.1f bar）、车速=%s km/h、"
+                         "挡位=%s、EPB=%s、CDP=%s；需结合目标压力、轮缸压力、"
+                         "减速度和液压检查确认根因"
+                         % (t - mismatch_since, max_pedal, min_pressure, PRESS_MIN,
+                            s.WCBS_VehicleSpeed, s.CVC_ACTGear,
+                            s.EPB_Sts, s.EPB_CDPActive))
+                  return "SUSPECTED_LOW_PRESSURE_RESPONSE"
+              return None
+
+          if pedal < PEDAL_CLEAR or pressure >= PRESS_MIN:
+              had_mismatch = mismatch_since is not None
+              mismatch_since = None; max_pedal = None; min_pressure = None
+              if had_mismatch:
+                  reason("踏板/压力响应筛查条件解除：踏板=%.1f%%、主缸压力=%.2f bar"
+                         % (pedal, pressure))
+              return "OK"
           return None
 
   # ===========================================================================
@@ -524,3 +734,83 @@ functions:
           if mismatch_since is None and (dsp in (None, "Off")):
               return "OK"
           return None
+
+  # ===========================================================================
+  # EPB / AVH 坡度接管边界
+  # ===========================================================================
+  - id: epb_avh_takeover_boundary
+    name: "EPB 接管 AVH 坡度边界"
+    description: >-
+      检查 AVH Active 期间 EPB 从 Released 进入 Locking/Locked 的接管边沿。
+      ESC_SlopeGrade 绝对值稳定至少 0.5s 后才参与判定：低于 25% 的接管标记为
+      BELOW_THRESHOLD（重点覆盖 22~23% 偶发现象）；达到或超过 25% 记为
+      EXPECTED_THRESHOLD。坡度缺失或尚未稳定时只记录证据不足，不臆测阈值违规。
+    signals:
+      - WCBS_AVH_Status               # 被接管功能状态
+      - EPB_Sts                       # EPB 接管反馈
+      - ESC_SlopeGrade                # 上下坡百分比，判定取绝对值
+      - ESC_VehicleStandstill
+      - WCBS_VehicleSpeed
+      - WCBS_MainCylinderPress
+      - WCBS_MainCylinderPressValid
+    code: |
+      ACTIVE_STATES = ["BELOW_THRESHOLD", "SLOPE_NOT_STABLE"]
+      INITIAL = "MONITORING"
+
+      TAKEOVER_SLOPE = 25.0   # %，需求定义的 EPB 接管 AVH 最小绝对坡度
+      SLOPE_HOLD = 0.5        # s，过滤坡度信号瞬时跳变和边界抖动
+
+      slope_candidate = None
+      slope_candidate_t = None
+      stable_slope = None
+
+      def update(t, s, dt):
+          global slope_candidate, slope_candidate_t, stable_slope
+
+          raw_slope = s.ESC_SlopeGrade
+          if raw_slope is None:
+              slope_candidate = None
+              slope_candidate_t = None
+              stable_slope = None
+          else:
+              try:
+                  slope = abs(float(raw_slope))
+              except (TypeError, ValueError):
+                  slope_candidate = None
+                  slope_candidate_t = None
+                  stable_slope = None
+              else:
+                  if slope != slope_candidate:
+                      slope_candidate = slope
+                      slope_candidate_t = t
+                  if (slope_candidate_t is not None
+                          and (t - slope_candidate_t) >= SLOPE_HOLD):
+                      stable_slope = slope_candidate
+
+          epb_takeover_edge = (
+              s.WCBS_AVH_Status == "AVH Active"
+              and s.EPB_Sts in ("Locking", "Locked")
+              and s.prev.EPB_Sts in (None, "Unknown", "Released")
+          )
+          if not epb_takeover_edge:
+              return "MONITORING"
+
+          context = ("EPB=%s、AVH=%s、车速=%s km/h、静止=%s、主缸=%s bar"
+                     % (s.EPB_Sts, s.WCBS_AVH_Status, s.WCBS_VehicleSpeed,
+                        s.ESC_VehicleStandstill, s.WCBS_MainCylinderPress))
+          if stable_slope is None:
+              attempt("AVH Active 期间检出 EPB 接管，但坡度未稳定满 %.1fs" % SLOPE_HOLD)
+              reason("接管边沿证据不足：ESC_SlopeGrade=%s，%s；不做 25%% 阈值判决"
+                     % (raw_slope, context))
+              return "SLOPE_NOT_STABLE"
+
+          if stable_slope < TAKEOVER_SLOPE:
+              attempt("EPB 在 %.1f%% 坡度接管 AVH（要求 >=%.1f%%）"
+                      % (stable_slope, TAKEOVER_SLOPE))
+              reason("检出低于阈值的 EPB 接管：稳定绝对坡度 %.1f%% < %.1f%%，%s"
+                     % (stable_slope, TAKEOVER_SLOPE, context))
+              return "BELOW_THRESHOLD"
+
+          reason("EPB 在稳定绝对坡度 %.1f%% 接管 AVH，满足 >=%.1f%% 的功能定义；%s"
+                 % (stable_slope, TAKEOVER_SLOPE, context))
+          return "EXPECTED_THRESHOLD"
