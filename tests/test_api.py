@@ -104,7 +104,7 @@ def test_functions_distinguish_nodata_from_missing(tmp_path):
     c = TestClient(app)
     c.post("/api/load/sample")
     dbc = ROOT / "samples" / "03_CCAN_EP_v2.1.0_20260417-MOD.dbc"
-    spec = ROOT / "samples" / "functions_ep35_switch.yaml"
+    spec = ROOT / "samples" / "function_specs" / "functions_ep35_switch.yaml"
     if not (dbc.exists() and spec.exists()):
         pytest.skip("EP35 samples not present")
     with open(dbc, "rb") as f:
@@ -148,7 +148,7 @@ def test_upload_spec_reads_saved_copy(client):
 
     回归用：曾经二次 file.file.read() 拿到 b""，规格静默变成 None。
     """
-    spec = (ROOT / "samples" / "functions.yaml").read_text(encoding="utf-8")
+    spec = (ROOT / "samples" / "function_specs" / "functions.yaml").read_text(encoding="utf-8")
     r = client.post("/api/upload/spec",
                     files={"file": ("functions.yaml", spec.encode("utf-8"), "text/yaml")})
     assert r.status_code == 200, r.text

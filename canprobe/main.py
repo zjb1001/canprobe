@@ -334,7 +334,7 @@ def load_sample():
     p = project()
     dbc = SAMPLES_DIR / "cruise.dbc"
     log = SAMPLES_DIR / "cruise.csv"
-    spec = SAMPLES_DIR / "functions.yaml"
+    spec = SAMPLES_DIR / "function_specs" / "functions.yaml"
     if not (dbc.exists() and log.exists() and spec.exists()):
         raise HTTPException(404, "示例文件缺失，请先运行 samples/generate_samples.py")
     p.load_dbc(str(dbc))

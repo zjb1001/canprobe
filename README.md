@@ -53,7 +53,7 @@ python3 run.py --port 9000 --no-browser
 ```
 
 首次启动会自动加载 `samples/` 下的示例（`cruise.dbc` + `cruise.csv` +
-`functions.yaml`）。也可以手动：顶部 **加载示例** / 拖拽 DBC、日志、规格文件到页面。
+`function_specs/functions.yaml`）。也可以手动：顶部 **加载示例** / 拖拽 DBC、日志、规格文件到页面。
 
 ## 目录结构
 
@@ -75,11 +75,13 @@ canprobe/
 │   └── vendor/echarts.min.js
 ├── samples/               # 示例数据 + 生成脚本
 │   ├── generate_samples.py
-│   ├── cruise.dbc / cruise.csv / functions.yaml
+│   ├── cruise.dbc / cruise.csv
+│   └── function_specs/    #   功能规格 yaml
+│       └── functions.yaml / functions_py.yaml / ...
 └── tests/                 # pytest
 ```
 
-## 功能分析规格（functions.yaml）
+## 功能分析规格（function_specs/functions.yaml）
 
 条件表达式语法：
 
@@ -94,7 +96,7 @@ canprobe/
 曲线，事件栏里全是这个 bit 的翻转记录。正确的粒度是一条完整链路——驾驶员请求 →
 总线传输 → ECU 判决 → 对外状态 → 上下文，用 `signals:` 段**按请求→反馈→上下文的
 顺序**全列出来（该顺序即加入 Graphics 的顺序），状态机吐出功能层面的处境，配合
-下方事件栏就是一条可读的事件历程。参考 `samples/functions_ep35_switch.yaml`：
+下方事件栏就是一条可读的事件历程。参考 `samples/function_specs/functions_ep35_switch.yaml`：
 同一份日志，21 个单信号 function 产出 1250 条事件（其中 663 条是一个开关位的翻转），
 重写成 4 个功能级 function 后是 17 条，条条是结论。
 
@@ -113,7 +115,7 @@ canprobe/
 | `trigger` | "尝试"条件：触发它但 `enter` 未满足 → 记为**被阻止的进入**（回答"为什么没进入"）。缺省时自动取 `enter` 中的边沿条件 |
 | `initial` | 初始是否已激活（默认 false） |
 
-示例（`samples/functions.yaml`）：
+示例（`samples/function_specs/functions.yaml`）：
 
 ```yaml
 functions:
@@ -180,7 +182,7 @@ functions:
 `update(t, s, dt)` 在每个采样点被调用一次，返回新状态（`None` 表示保持）。
 `reason(msg)` 给本次跳变标注原因；`attempt(msg)` 标记一次被阻止的尝试；
 模块级变量可在多次调用间保持（用于计时）。完整示例见
-`samples/functions_py.yaml`（含"温度>120 持续 0.5s 才进入"的防抖计时）。
+`samples/function_specs/functions_py.yaml`（含"温度>120 持续 0.5s 才进入"的防抖计时）。
 
 ## API
 

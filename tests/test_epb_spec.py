@@ -7,7 +7,7 @@ from canprobe.analyzer import analyze_functions
 
 
 ROOT = Path(__file__).resolve().parent.parent
-SPEC_PATH = ROOT / "samples" / "functions_epb.yaml"
+SPEC_PATH = ROOT / "samples" / "function_specs" / "functions_epb.yaml"
 
 
 class TimelineStore:

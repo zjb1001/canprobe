@@ -96,7 +96,7 @@ def test_invalid_condition():
 
 # --- function analysis over the sample scenario --------------------------- #
 def test_analyze_cruise_events():
-    spec = yaml.safe_load((ROOT / "samples" / "functions.yaml").read_text(encoding="utf-8"))
+    spec = yaml.safe_load((ROOT / "samples" / "function_specs" / "functions.yaml").read_text(encoding="utf-8"))
     res = analyze_functions(_store(), spec)
 
     events = {(e["function"], e["type"]): e for e in res["events"]}
@@ -116,7 +116,7 @@ def test_analyze_cruise_events():
 
 
 def test_analyze_blocked_attempt():
-    spec = yaml.safe_load((ROOT / "samples" / "functions.yaml").read_text(encoding="utf-8"))
+    spec = yaml.safe_load((ROOT / "samples" / "function_specs" / "functions.yaml").read_text(encoding="utf-8"))
     res = analyze_functions(_store(), spec)
 
     attempts = [a for a in res["attempts"] if a["function"] == "cruise"]
@@ -131,7 +131,7 @@ def test_analyze_blocked_attempt():
 
 
 def test_analyze_intervals():
-    spec = yaml.safe_load((ROOT / "samples" / "functions.yaml").read_text(encoding="utf-8"))
+    spec = yaml.safe_load((ROOT / "samples" / "function_specs" / "functions.yaml").read_text(encoding="utf-8"))
     res = analyze_functions(_store(), spec)
     assert res["intervals"]["cruise"] == [[8.0, 15.0]]
 

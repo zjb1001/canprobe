@@ -3,7 +3,7 @@
 Produces:
 * ``cruise.dbc``     — a small vehicle DBC (cruise control + motor status)
 * ``cruise.csv``     — a ~30 s CAN trace exercising enter / exit / blocked entry
-* ``functions.yaml`` — the function analysis spec
+* ``function_specs/functions.yaml`` — the function analysis spec
 
 Scenario (times in seconds):
 

@@ -26,6 +26,7 @@ from canprobe.store import Project  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SAMPLES = os.path.join(ROOT, "samples")
+FUNCTION_SPECS = os.path.join(SAMPLES, "function_specs")
 
 CASES = [
     ("ep35_signal", "03_CCAN_EP_v2.1.0_20260417-MOD.dbc",
@@ -88,7 +89,7 @@ def dump_case(name: str, dbc: str, log: str, spec: str) -> dict:
     out["trace"] = _round(st.trace_window(t0, t0 + (t1 - t0) * 0.01, 50))
     out["decode_status"] = {str(k): v for k, v in sorted(st.message_decode_status().items())}
 
-    spec_obj = yaml.safe_load(open(os.path.join(SAMPLES, spec), encoding="utf-8").read())
+    spec_obj = yaml.safe_load(open(os.path.join(FUNCTION_SPECS, spec), encoding="utf-8").read())
     out["analysis"] = _round(analyze_functions(st, spec_obj))
     return out
 
@@ -115,7 +116,8 @@ def main() -> int:
 
     result = {}
     for name, dbc, log, spec in CASES:
-        if not all(os.path.exists(os.path.join(SAMPLES, f)) for f in (dbc, log, spec)):
+        if not all(os.path.exists(os.path.join(SAMPLES, f)) for f in (dbc, log)) or \
+                not os.path.exists(os.path.join(FUNCTION_SPECS, spec)):
             print(f"skip {name} (missing sample)")
             continue
         print(f"dumping {name} …", flush=True)
