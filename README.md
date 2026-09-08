@@ -77,7 +77,7 @@ canprobe/
 │   ├── generate_samples.py
 │   ├── cruise.dbc / cruise.csv
 │   └── function_specs/    #   功能规格 yaml
-│       └── functions.yaml / functions_py.yaml / ...
+│       └── functions.yaml / functions_code.yaml / ...
 └── tests/                 # pytest
 ```
 
@@ -157,7 +157,7 @@ functions:
 
 ```yaml
 functions:
-  - id: cruise_py
+  - id: cruise_code
     name: "定速巡航 (Python)"
     code: |
       ACTIVE = "ACTIVE"          # 可选：哪些状态算"激活"
@@ -182,7 +182,7 @@ functions:
 `update(t, s, dt)` 在每个采样点被调用一次，返回新状态（`None` 表示保持）。
 `reason(msg)` 给本次跳变标注原因；`attempt(msg)` 标记一次被阻止的尝试；
 模块级变量可在多次调用间保持（用于计时）。完整示例见
-`samples/function_specs/functions_py.yaml`（含"温度>120 持续 0.5s 才进入"的防抖计时）。
+`samples/function_specs/functions_code.yaml`（含"温度>120 持续 0.5s 才进入"的防抖计时）。
 
 ## API
 

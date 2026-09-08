@@ -5,7 +5,7 @@ This is the escape hatch for logic that is awkward to express declaratively
 carry a ``code`` field instead of ``enter``/``exit``::
 
     functions:
-      - id: cruise_py
+      - id: cruise_code
         name: "定速巡航 (Python)"
         code: |
           ACTIVE = "ACTIVE"          # 可选：明确哪些状态算"激活"

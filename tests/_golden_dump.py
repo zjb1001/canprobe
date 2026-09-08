@@ -34,7 +34,7 @@ CASES = [
     ("wild_hba", "03_CCAN_EP_v2.1.0_20260417-MOD.dbc",
      "Wild-HBA.blf", "functions_hba.yaml"),
     ("cruise", "cruise.dbc", "cruise.csv", "functions.yaml"),
-    ("cruise_py", "cruise.dbc", "cruise.csv", "functions_py.yaml"),
+    ("cruise_code", "cruise.dbc", "cruise.csv", "functions_code.yaml"),
 ]
 
 

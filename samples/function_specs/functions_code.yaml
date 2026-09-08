@@ -12,7 +12,7 @@
 #
 # 适合声明式写不动的逻辑：计数器、定时器、滞回、跨信号运算等。
 functions:
-  - id: cruise_py
+  - id: cruise_code
     name: "定速巡航 (Python 逻辑)"
     description: "带滞回的巡航：SET 按下且车速≥30 进入，刹车/取消退出，车速<25 掉速退出"
     code: |
@@ -34,7 +34,7 @@ functions:
               return "IDLE"
           return None
 
-  - id: overtq_py
+  - id: overtq_code
     name: "过温保护 (Python 计时)"
     description: "温度 >120 持续 0.5s 才进入（防抖），<105 退出 —— 演示计时逻辑"
     code: |
